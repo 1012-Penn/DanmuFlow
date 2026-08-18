@@ -71,7 +71,7 @@ ws://localhost:8080/ws?room_id=room-a&user_id=alice
 {"sequence":1,"content":"hello"}
 ```
 
-语义错误（空内容、超长、敏感词）以错误 JSON 返回，格式统一为：
+语义错误（空内容、超长、敏感词、消息总线不可用）以错误 JSON 返回，格式统一为：
 
 ```json
 {"code":"empty_content","message":"content cannot be empty"}
@@ -85,6 +85,7 @@ ws://localhost:8080/ws?room_id=room-a&user_id=alice
 | `empty_content` | 正文为空或全是空白字符 | 返回错误，连接**继续** |
 | `content_too_long` | 正文超过 500 个字符 | 返回错误，连接**继续** |
 | `sensitive_content` | 命中敏感词 | 返回错误，连接**继续** |
+| `message_bus_unavailable` | 消息总线队列持续满，1 秒内无法入队 | 返回错误，连接**继续** |
 
 单条 WebSocket 数据帧超过 4 KiB 时，服务端发送 WebSocket 关闭帧 `1009`（message too big）并结束连接，不返回上面的 JSON 错误码。
 
@@ -98,7 +99,7 @@ ws://localhost:8080/ws?room_id=room-a&user_id=alice
 - 默认拦截 `赌博` 和 `诈骗` 等敏感词，命中后不广播、不消耗房间序号；
 - 服务重启后连接和消息都会丢失；
 - 慢客户端可能丢失自己的消息，但不会阻塞房间内其他客户端；
-- 尚未接入 Kafka、Redis、MySQL、登录鉴权和历史消息补偿。
+- 当前已接入进程内 InMemoryBus，但尚未接入 Kafka、Redis、MySQL、登录鉴权和历史消息补偿。
 
 ## 项目结构
 
@@ -106,6 +107,8 @@ ws://localhost:8080/ws?room_id=room-a&user_id=alice
 cmd/server/              服务启动入口
 internal/httpserver/     HTTP/WebSocket 网关层
 internal/room/           内存房间模型（房间注册、成员、序号、广播）
+internal/message/        跨组件弹幕消息模型
+internal/bus/             消息总线抽象和 InMemoryBus
 internal/ratelimit/      按 user_id 维度的令牌桶限流器
 internal/sensitive/      内存敏感词过滤
 internal/logging/        结构化日志（zap）初始化

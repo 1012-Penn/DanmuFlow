@@ -40,7 +40,11 @@ func NewWithLogger(addr string, logger *zap.Logger) *http.Server {
 	// 第一版词库先以内存配置注入，后续可以替换为配置文件或 Redis，
 	// 而不需要改变 WebSocket 处理器和过滤器的调用方式。
 	sensitiveFilter := sensitive.New([]string{"赌博", "诈骗"})
-	websocketHandler := newWebSocketHandler(rooms, messageLimiter, sensitiveFilter, logger.Named("websocket"))
+	messageBus, cancelConsumer, err := newInMemoryMessageBus(rooms, logger.Named("message_bus"))
+	if err != nil {
+		panic(err)
+	}
+	websocketHandler := newWebSocketHandler(rooms, messageLimiter, sensitiveFilter, messageBus, logger.Named("websocket"))
 
 	// 根路径用于快速确认服务已经启动。
 	router.GET("/", func(c *gin.Context) {
@@ -59,8 +63,10 @@ func NewWithLogger(addr string, logger *zap.Logger) *http.Server {
 		websocketHandler.ServeHTTP(c.Writer, c.Request)
 	})
 
-	return &http.Server{
+	server := &http.Server{
 		Addr:    addr,
 		Handler: router,
 	}
+	server.RegisterOnShutdown(cancelConsumer)
+	return server
 }

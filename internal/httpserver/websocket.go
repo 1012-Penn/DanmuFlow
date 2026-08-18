@@ -1,13 +1,18 @@
 package httpserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"github.com/1012-Penn/DanmuFlow/internal/bus"
+	"github.com/1012-Penn/DanmuFlow/internal/message"
 	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"github.com/1012-Penn/DanmuFlow/internal/sensitive"
@@ -29,7 +34,12 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 	// writeWait 限制一次控制帧写入最多等待多久。
 	writeWait = 10 * time.Second
+	// messageBusPublishWait 限制接入层等待消息队列空间的最长时间。
+	// 队列持续满时，连接不能无限期卡在 Publish 上。
+	messageBusPublishWait = time.Second
 )
+
+var messageIDCounter uint64
 
 // websocketRequest 是客户端通过 WebSocket 发送给服务端的消息格式。
 // 当前只包含弹幕正文，后续可以扩展消息类型、时间戳等字段。
@@ -67,7 +77,7 @@ type protocolError struct {
 
 // newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, logger *zap.Logger) http.Handler {
+func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, messageBus bus.Bus, logger *zap.Logger) http.Handler {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -226,7 +236,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 		}
 
 		// 主循环负责读取客户端发来的弹幕。
-		// 每读到一条，就调用 Publish 广播给房间里的所有客户端（包括发送者自己）。
+		// 每读到一条，就先发布到消息总线；后台消费者再调用 Room.Publish 广播给房间里的所有客户端。
 		for {
 			// 先完整读取一条消息再解析 JSON。ReadMessage 在读取过程中受
 			// maxWebSocketFrameSize 限制：一旦累计字节数超过限制，Gorilla
@@ -305,20 +315,43 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				continue
 			}
 
-			// 限流发生在 Publish 之前，超限消息不会消耗房间序号，也不会进入广播链路。
+			// 限流发生在消息总线 Publish 之前，超限消息不会进入异步消息链路，
+			// 也不会消耗房间序号。
 			// 限流暂时不返回错误帧，客户端保持连接并继续发送后续消息。
 			if !messageLimiter.Allow(userID) {
 				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "rate_limit"))...)
 				continue
 			}
 
-			// 发布弹幕。如果房间为空等业务错误导致发布失败，当前连接也无法继续正常工作。
-			if err := chatRoom.Publish(request.Content); err != nil {
-				logger.Error("message_publish_failed", append(connectionFields, zap.Error(err))...)
-				return
+			danmaku := message.Danmaku{
+				MessageID: strconv.FormatUint(nextMessageID(), 10),
+				RoomID:    roomID,
+				UserID:    userID,
+				Content:   request.Content,
+				CreatedAt: time.Now(),
+			}
+			publishContext, cancelPublish := context.WithTimeout(r.Context(), messageBusPublishWait)
+			err = messageBus.Publish(publishContext, danmaku)
+			cancelPublish()
+			if err != nil {
+				logger.Debug("message_publish_rejected", append(connectionFields,
+					zap.String("reason", "message_bus_unavailable"),
+					zap.String("message_id", danmaku.MessageID),
+					zap.Error(err),
+				)...)
+				if !queueProtocolError(websocketErrorResponse{
+					Code:    "message_bus_unavailable",
+					Message: "message queue is temporarily unavailable",
+				}) {
+					return
+				}
 			}
 		}
 	})
+}
+
+func nextMessageID() uint64 {
+	return atomic.AddUint64(&messageIDCounter, 1)
 }
 
 // writeWebSocketJSON 是连接的统一数据帧写出口。
