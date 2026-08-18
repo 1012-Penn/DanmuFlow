@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -204,16 +205,44 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 		// 主循环负责读取客户端发来的弹幕。
 		// 每读到一条，就调用 Publish 广播给房间里的所有客户端（包括发送者自己）。
 		for {
-			var request websocketRequest
-			if err := conn.ReadJSON(&request); err != nil {
+			// 先完整读取一条消息再解析 JSON。ReadMessage 在读取过程中受
+			// maxWebSocketFrameSize 限制：一旦累计字节数超过限制，Gorilla
+			// 会发送 1009 关闭帧并返回 ErrReadLimit。这样大小限制始终在 JSON
+			// 校验之前生效，超大帧无论内容是否合法都会先触发 1009 关闭；
+			// 如果直接 ReadJSON，垃圾内容的 JSON 解析错误会先返回，导致
+			// 超大帧被当成 invalid_json 处理，而不是按大小被拒绝。
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
 				// 超大帧由 Gorilla 发送 1009 关闭帧；其他读取错误通常表示
-				// 客户端断开或 JSON 语法错误。ReadJSON 出错后不能继续复用读循环。
-				if !errors.Is(err, websocket.ErrReadLimit) && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				// 客户端断开或 JSON 语法错误。ReadMessage 出错后不能继续复用读循环。
+				if errors.Is(err, websocket.ErrReadLimit) {
+					// Gorilla 已经发出 1009 关闭帧。短暂读取剩余数据，等待
+					// 客户端的关闭回应，避免底层 TCP 连接在关闭帧送达前因为
+					// 还有未读取的数据而发送 RST，丢弃已写入的关闭帧。
+					_ = conn.SetReadDeadline(time.Now().Add(writeWait))
+					for {
+						if _, _, err := conn.ReadMessage(); err != nil {
+							break
+						}
+					}
+				} else if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					_ = queueProtocolError(websocketErrorResponse{
 						Code:    invalidJSONCode,
 						Message: "message must be valid JSON",
 					})
 				}
+				return
+			}
+
+			var request websocketRequest
+			if err := json.Unmarshal(payload, &request); err != nil {
+				// JSON 语法错误与 ReadMessage 阶段的读取错误一样会结束连接，
+				// 发送错误帧后退出读循环。queueProtocolError 会等待错误帧
+				// 真正写入，避免连接在错误帧送达前被关闭。
+				_ = queueProtocolError(websocketErrorResponse{
+					Code:    invalidJSONCode,
+					Message: "message must be valid JSON",
+				})
 				return
 			}
 
