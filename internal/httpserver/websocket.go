@@ -12,6 +12,7 @@ import (
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"github.com/1012-Penn/DanmuFlow/internal/sensitive"
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 )
 
 const (
@@ -66,7 +67,11 @@ type protocolError struct {
 
 // newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter) http.Handler {
+func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, logger *zap.Logger) http.Handler {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
 	// Upgrader 负责把普通 HTTP 请求升级为 WebSocket 长连接。
 	// 这里使用零值配置，Gorilla 会执行默认的 Origin 检查，避免无意中接受任意来源的浏览器请求。
 	var upgrader websocket.Upgrader
@@ -76,11 +81,13 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 		//    Upgrade 成功后 HTTP 响应已经变成 WebSocket 帧，不能再用 http.Error 返回 400。
 		userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
 		if userID == "" {
+			logger.Debug("websocket_rejected", zap.String("reason", "missing_user_id"))
 			http.Error(w, "user_id is required\n", http.StatusBadRequest)
 			return
 		}
 		roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
 		if roomID == "" {
+			logger.Debug("websocket_rejected", zap.String("reason", "missing_room_id"))
 			http.Error(w, "room_id is required\n", http.StatusBadRequest)
 			return
 		}
@@ -89,6 +96,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 		// 如果握手失败（例如不是 WebSocket 请求），直接返回即可，不需要继续处理。
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
+			logger.Debug("websocket_rejected", zap.String("reason", "upgrade_failed"), zap.Error(err))
 			return
 		}
 		// 这里先注册一个基础清理，确保即使后续初始化失败，连接也会被关闭。
@@ -102,16 +110,31 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 		// Join 会为这个连接创建独立的消息 channel，之后房间广播的消息都会写入这个 channel。
 		chatRoom, err := rooms.GetOrCreate(roomID)
 		if err != nil {
+			logger.Error("websocket_room_lookup_failed", zap.String("room_id", roomID), zap.String("user_id", userID), zap.Error(err))
 			return
 		}
 		client, err := chatRoom.Join(userID)
 		if err != nil {
 			// 加入失败（例如重复 user_id）时无法继续收发消息，直接关闭连接。
+			logger.Debug("websocket_rejected", zap.String("reason", "join_room_failed"), zap.String("room_id", roomID), zap.String("user_id", userID), zap.Error(err))
 			return
 		}
 
+		connectedAt := time.Now()
+		connectionFields := []zap.Field{
+			zap.String("room_id", roomID),
+			zap.String("user_id", userID),
+			zap.String("remote_addr", r.RemoteAddr),
+		}
+		logger.Info("websocket_connected", connectionFields...)
+		defer func() {
+			logger.Info("websocket_disconnected",
+				append(connectionFields, zap.Duration("duration", time.Since(connectedAt)))...,
+			)
+		}()
+
 		// 5. 设置心跳读超时，并在收到客户端 Pong 时延长超时时间。
-		//    如果客户端长期没有回应，ReadJSON 最终会返回超时错误，触发连接清理。
+		//    如果客户端长期没有回应，ReadMessage 最终会返回超时错误，触发连接清理。
 		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 		conn.SetPongHandler(func(string) error {
 			return conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -216,6 +239,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				// 超大帧由 Gorilla 发送 1009 关闭帧；其他读取错误通常表示
 				// 客户端断开或 JSON 语法错误。ReadMessage 出错后不能继续复用读循环。
 				if errors.Is(err, websocket.ErrReadLimit) {
+					logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "frame_too_large"))...)
 					// Gorilla 已经发出 1009 关闭帧。短暂读取剩余数据，等待
 					// 客户端的关闭回应，避免底层 TCP 连接在关闭帧送达前因为
 					// 还有未读取的数据而发送 RST，丢弃已写入的关闭帧。
@@ -226,6 +250,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 						}
 					}
 				} else if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					logger.Debug("websocket_read_failed", append(connectionFields, zap.Error(err))...)
 					_ = queueProtocolError(websocketErrorResponse{
 						Code:    invalidJSONCode,
 						Message: "message must be valid JSON",
@@ -236,6 +261,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 
 			var request websocketRequest
 			if err := json.Unmarshal(payload, &request); err != nil {
+				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "invalid_json"))...)
 				// JSON 语法错误与 ReadMessage 阶段的读取错误一样会结束连接，
 				// 发送错误帧后退出读循环。queueProtocolError 会等待错误帧
 				// 真正写入，避免连接在错误帧送达前被关闭。
@@ -250,6 +276,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			// 这里不修改合法正文本身，因此原有广播内容行为保持不变。
 			switch {
 			case strings.TrimSpace(request.Content) == "":
+				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "empty_content"))...)
 				if !queueProtocolError(websocketErrorResponse{
 					Code:    emptyContentCode,
 					Message: "content cannot be empty",
@@ -258,6 +285,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				}
 				continue
 			case utf8.RuneCountInString(request.Content) > maxContentRunes:
+				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "content_too_long"))...)
 				if !queueProtocolError(websocketErrorResponse{
 					Code:    contentTooLongCode,
 					Message: "content is too long",
@@ -267,6 +295,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				continue
 			}
 			if _, matched := sensitiveFilter.Match(request.Content); matched {
+				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "sensitive_content"))...)
 				if !queueProtocolError(websocketErrorResponse{
 					Code:    sensitiveContentCode,
 					Message: "message contains sensitive content",
@@ -279,11 +308,13 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			// 限流发生在 Publish 之前，超限消息不会消耗房间序号，也不会进入广播链路。
 			// 限流暂时不返回错误帧，客户端保持连接并继续发送后续消息。
 			if !messageLimiter.Allow(userID) {
+				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "rate_limit"))...)
 				continue
 			}
 
 			// 发布弹幕。如果房间为空等业务错误导致发布失败，当前连接也无法继续正常工作。
 			if err := chatRoom.Publish(request.Content); err != nil {
+				logger.Error("message_publish_failed", append(connectionFields, zap.Error(err))...)
 				return
 			}
 		}

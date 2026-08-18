@@ -14,6 +14,12 @@ go run ./cmd/server
 DANMUFLOW_HTTP_ADDR=:9090 go run ./cmd/server
 ```
 
+日志默认以 JSON 格式输出到标准输出，默认等级为 `info`。开发排查时可以临时开启更详细的日志：
+
+```bash
+DANMUFLOW_LOG_LEVEL=debug go run ./cmd/server
+```
+
 可用端点：
 
 - `GET /`：确认服务已启动
