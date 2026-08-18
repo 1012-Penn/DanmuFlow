@@ -79,3 +79,42 @@ func TestWebSocketRequiresRoomID(t *testing.T) {
 		t.Fatalf("status = %d, want 400", recorder.Code)
 	}
 }
+
+func TestWebSocketDropsMessagesOverUserRateLimit(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("environment does not allow local network listeners: %v", err)
+	}
+
+	server := httptest.NewUnstartedServer(New(":0").Handler)
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?room_id=room-a&user_id=alice"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for i := 0; i < 10; i++ {
+		if err := conn.WriteJSON(websocketRequest{Content: "message"}); err != nil {
+			t.Fatal(err)
+		}
+		var response websocketResponse
+		if err := conn.ReadJSON(&response); err != nil {
+			t.Fatalf("reading allowed message %d: %v", i+1, err)
+		}
+	}
+
+	// 第 11 条消息仍在突发额度之外，应被限流器丢弃。
+	if err := conn.WriteJSON(websocketRequest{Content: "message"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var response websocketResponse
+	if err := conn.ReadJSON(&response); err == nil {
+		t.Fatalf("rate-limited message was broadcast: %+v", response)
+	}
+}

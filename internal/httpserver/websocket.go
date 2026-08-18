@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"github.com/gorilla/websocket"
 )
@@ -33,7 +34,7 @@ type websocketResponse struct {
 
 // newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(rooms *room.Registry) http.Handler {
+func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter) http.Handler {
 	// Upgrader 负责把普通 HTTP 请求升级为 WebSocket 长连接。
 	// 这里使用零值配置，Gorilla 会执行默认的 Origin 检查，避免无意中接受任意来源的浏览器请求。
 	var upgrader websocket.Upgrader
@@ -145,6 +146,12 @@ func newWebSocketHandler(rooms *room.Registry) http.Handler {
 				// 客户端关闭、网络异常或消息格式错误都会让 ReadJSON 返回错误。
 				// 此时不需要继续读，直接返回触发上面的清理逻辑。
 				return
+			}
+
+			// 限流发生在 Publish 之前，超限消息不会消耗房间序号，也不会进入广播链路。
+			// 当前协议没有定义错误帧，因此这里丢弃本条消息并保持连接继续读取。
+			if !messageLimiter.Allow(userID) {
+				continue
 			}
 
 			// 发布弹幕。如果房间为空等业务错误导致发布失败，当前连接也无法继续正常工作。
