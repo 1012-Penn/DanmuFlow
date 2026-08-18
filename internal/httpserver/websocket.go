@@ -9,6 +9,7 @@ import (
 
 	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
+	"github.com/1012-Penn/DanmuFlow/internal/sensitive"
 	"github.com/gorilla/websocket"
 )
 
@@ -49,9 +50,10 @@ type websocketErrorResponse struct {
 }
 
 const (
-	invalidJSONCode    = "invalid_json"
-	emptyContentCode   = "empty_content"
-	contentTooLongCode = "content_too_long"
+	invalidJSONCode      = "invalid_json"
+	emptyContentCode     = "empty_content"
+	contentTooLongCode   = "content_too_long"
+	sensitiveContentCode = "sensitive_content"
 )
 
 // protocolError 是写协程处理的一条错误响应。
@@ -63,7 +65,7 @@ type protocolError struct {
 
 // newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter) http.Handler {
+func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter) http.Handler {
 	// Upgrader 负责把普通 HTTP 请求升级为 WebSocket 长连接。
 	// 这里使用零值配置，Gorilla 会执行默认的 Origin 检查，避免无意中接受任意来源的浏览器请求。
 	var upgrader websocket.Upgrader
@@ -230,6 +232,15 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				if !queueProtocolError(websocketErrorResponse{
 					Code:    contentTooLongCode,
 					Message: "content is too long",
+				}) {
+					return
+				}
+				continue
+			}
+			if _, matched := sensitiveFilter.Match(request.Content); matched {
+				if !queueProtocolError(websocketErrorResponse{
+					Code:    sensitiveContentCode,
+					Message: "message contains sensitive content",
 				}) {
 					return
 				}

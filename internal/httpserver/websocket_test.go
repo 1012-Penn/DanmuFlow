@@ -151,6 +151,47 @@ func TestWebSocketRejectsOverlongContent(t *testing.T) {
 	}
 }
 
+func TestWebSocketRejectsSensitiveContent(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("environment does not allow local network listeners: %v", err)
+	}
+
+	server := httptest.NewUnstartedServer(New(":0").Handler)
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?room_id=room-a&user_id=alice"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(websocketRequest{Content: "这是一条赌博消息"}); err != nil {
+		t.Fatal(err)
+	}
+	var protocolError websocketErrorResponse
+	if err := conn.ReadJSON(&protocolError); err != nil {
+		t.Fatal(err)
+	}
+	if protocolError.Code != sensitiveContentCode {
+		t.Fatalf("error = %+v, want code %q", protocolError, sensitiveContentCode)
+	}
+
+	if err := conn.WriteJSON(websocketRequest{Content: "正常消息"}); err != nil {
+		t.Fatal(err)
+	}
+	var response websocketResponse
+	if err := conn.ReadJSON(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Sequence != 1 || response.Content != "正常消息" {
+		t.Fatalf("response = %+v", response)
+	}
+}
+
 func TestWebSocketRejectsOversizedFrame(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
