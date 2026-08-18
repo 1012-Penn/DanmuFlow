@@ -1,9 +1,11 @@
 package httpserver
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
@@ -11,6 +13,13 @@ import (
 )
 
 const (
+	// maxWebSocketFrameSize 限制单条 WebSocket 消息的大小，避免异常客户端
+	// 通过超大帧占用过多内存。这个限制作用于 JSON 帧的完整字节数。
+	maxWebSocketFrameSize = 4 * 1024
+	// maxContentRunes 限制一条弹幕正文的字符数。使用字符数而不是字节数，
+	// 这样中文和英文用户看到的是一致的长度规则。
+	maxContentRunes = 500
+
 	// pongWait 是服务端允许客户端没有回应 Pong 的最长时间。
 	pongWait = 60 * time.Second
 	// pingPeriod 要小于 pongWait，保证服务端会在读超时前主动发出 Ping。
@@ -30,6 +39,26 @@ type websocketRequest struct {
 type websocketResponse struct {
 	Sequence uint64 `json:"sequence"`
 	Content  string `json:"content"`
+}
+
+// websocketErrorResponse 是服务端返回给客户端的协议错误格式。
+// 错误只描述当前请求失败，不代表 WebSocket 一定会关闭。
+type websocketErrorResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+const (
+	invalidJSONCode    = "invalid_json"
+	emptyContentCode   = "empty_content"
+	contentTooLongCode = "content_too_long"
+)
+
+// protocolError 是写协程处理的一条错误响应。
+// done 用来让读协程确认错误已经写入，避免读协程立刻关闭连接导致错误帧丢失。
+type protocolError struct {
+	response websocketErrorResponse
+	done     chan error
 }
 
 // newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
@@ -62,6 +91,9 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 		// 这里先注册一个基础清理，确保即使后续初始化失败，连接也会被关闭。
 		// 后面还有一个更完整的清理 defer，负责 Leave、再次 Close 和等待写协程退出。
 		defer conn.Close()
+		// 限制每个 WebSocket 数据帧的大小。超过限制时 Gorilla 会发送
+		// 1009 (message too big) 关闭帧，随后读循环退出。
+		conn.SetReadLimit(maxWebSocketFrameSize)
 
 		// 根据 room_id 找到对应的内存房间，再让当前用户加入这个房间。
 		// Join 会为这个连接创建独立的消息 channel，之后房间广播的消息都会写入这个 channel。
@@ -102,6 +134,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 		// writeDone 用于通知当前 goroutine：后台写协程已经退出。
 		// 这样在连接关闭时，可以等待写协程安全结束，避免它还在使用已关闭的连接。
 		writeDone := make(chan struct{})
+		protocolErrors := make(chan protocolError, 1)
 
 		// 启动一个新的 goroutine 来异步处理消息写入。
 		// 读循环只负责接收客户端消息，写协程只负责把房间消息推回客户端，
@@ -111,21 +144,28 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			// 这通常用于通知其他协程写入操作已完成。
 			defer close(writeDone)
 
-			// 从 client.Messages 通道中循环读取消息。
-			// 当通道被关闭时，循环自动结束（例如客户端 Leave 后房间关闭了这个 channel）。
-			for message := range client.Messages {
-				// 构造 WebSocket 响应对象。
-				// 将消息的序列号和内容包装成响应格式，供客户端识别顺序和展示内容。
-				response := websocketResponse{
-					Sequence: message.Sequence,
-					Content:  message.Content,
-				}
-
-				// 将响应以 JSON 格式写入 WebSocket 连接。
-				// 如果写入失败（例如客户端断开），直接返回结束当前 goroutine；
-				// 此时会触发上面的 defer 关闭 writeDone 通道。
-				if err := conn.WriteJSON(response); err != nil {
-					return
+			// 房间消息和协议错误都必须经过同一个写协程。
+			// Gorilla WebSocket 不允许多个 goroutine 同时写数据帧；统一出口
+			// 可以避免“广播写入”和“错误响应写入”并发操作同一连接。
+			for {
+				select {
+				case message, open := <-client.Messages:
+					if !open {
+						return
+					}
+					response := websocketResponse{
+						Sequence: message.Sequence,
+						Content:  message.Content,
+					}
+					if err := writeWebSocketJSON(conn, response); err != nil {
+						return
+					}
+				case protocolErr := <-protocolErrors:
+					err := writeWebSocketJSON(conn, protocolErr.response)
+					protocolErr.done <- err
+					if err != nil {
+						return
+					}
 				}
 			}
 		}()
@@ -138,18 +178,66 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			<-writeDone
 		}()
 
+		// queueProtocolError 把错误交给唯一的写协程，并等待写入结果。
+		// 对于语义错误，等待完成后连接仍然可以继续接收下一条弹幕；
+		// 对于 JSON 语法错误，调用方会在发送错误后结束当前连接。
+		queueProtocolError := func(response websocketErrorResponse) bool {
+			protocolErr := protocolError{
+				response: response,
+				done:     make(chan error, 1),
+			}
+			select {
+			case protocolErrors <- protocolErr:
+			case <-writeDone:
+				return false
+			}
+			select {
+			case err := <-protocolErr.done:
+				return err == nil
+			case <-writeDone:
+				return false
+			}
+		}
+
 		// 主循环负责读取客户端发来的弹幕。
 		// 每读到一条，就调用 Publish 广播给房间里的所有客户端（包括发送者自己）。
 		for {
 			var request websocketRequest
 			if err := conn.ReadJSON(&request); err != nil {
-				// 客户端关闭、网络异常或消息格式错误都会让 ReadJSON 返回错误。
-				// 此时不需要继续读，直接返回触发上面的清理逻辑。
+				// 超大帧由 Gorilla 发送 1009 关闭帧；其他读取错误通常表示
+				// 客户端断开或 JSON 语法错误。ReadJSON 出错后不能继续复用读循环。
+				if !errors.Is(err, websocket.ErrReadLimit) && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					_ = queueProtocolError(websocketErrorResponse{
+						Code:    invalidJSONCode,
+						Message: "message must be valid JSON",
+					})
+				}
 				return
 			}
 
+			// 空白内容和超长内容在进入限流、房间序号分配及广播之前被拒绝。
+			// 这里不修改合法正文本身，因此原有广播内容行为保持不变。
+			switch {
+			case strings.TrimSpace(request.Content) == "":
+				if !queueProtocolError(websocketErrorResponse{
+					Code:    emptyContentCode,
+					Message: "content cannot be empty",
+				}) {
+					return
+				}
+				continue
+			case utf8.RuneCountInString(request.Content) > maxContentRunes:
+				if !queueProtocolError(websocketErrorResponse{
+					Code:    contentTooLongCode,
+					Message: "content is too long",
+				}) {
+					return
+				}
+				continue
+			}
+
 			// 限流发生在 Publish 之前，超限消息不会消耗房间序号，也不会进入广播链路。
-			// 当前协议没有定义错误帧，因此这里丢弃本条消息并保持连接继续读取。
+			// 限流暂时不返回错误帧，客户端保持连接并继续发送后续消息。
 			if !messageLimiter.Allow(userID) {
 				continue
 			}
@@ -160,4 +248,13 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			}
 		}
 	})
+}
+
+// writeWebSocketJSON 是连接的统一数据帧写出口。
+// 所有普通消息和协议错误都由同一个 goroutine 调用，避免并发写入连接。
+func writeWebSocketJSON(conn *websocket.Conn, value any) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+		return err
+	}
+	return conn.WriteJSON(value)
 }
