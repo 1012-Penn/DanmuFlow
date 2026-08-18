@@ -5,6 +5,7 @@ package httpserver
 import (
 	"net/http"
 
+	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"github.com/gin-gonic/gin"
 )
@@ -17,10 +18,14 @@ func New(addr string) *http.Server {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
 
-	// chatRoom 是整个进程共享的内存房间实例。
-	// 所有 WebSocket 连接都加入同一个房间，当前版本用来演示多客户端广播。
-	chatRoom := room.New()
-	websocketHandler := newWebSocketHandler(chatRoom)
+	// rooms 是整个进程共享的房间注册表。
+	// 每个 room_id 对应一个独立的 Room，同一个房间内的连接才会互相广播。
+	rooms := room.NewRegistry()
+	messageLimiter, err := ratelimit.New(5, 10)
+	if err != nil {
+		panic(err)
+	}
+	websocketHandler := newWebSocketHandler(rooms, messageLimiter)
 
 	// 根路径用于快速确认服务已经启动。
 	router.GET("/", func(c *gin.Context) {

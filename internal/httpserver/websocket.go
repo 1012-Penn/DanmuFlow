@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"github.com/gorilla/websocket"
 )
@@ -31,9 +32,9 @@ type websocketResponse struct {
 	Content  string `json:"content"`
 }
 
-// newWebSocketHandler 把一条 WebSocket 连接接到内存房间。
+// newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(chatRoom *room.Room) http.Handler {
+func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter) http.Handler {
 	// Upgrader 负责把普通 HTTP 请求升级为 WebSocket 长连接。
 	// 这里使用零值配置，Gorilla 会执行默认的 Origin 检查，避免无意中接受任意来源的浏览器请求。
 	var upgrader websocket.Upgrader
@@ -44,6 +45,11 @@ func newWebSocketHandler(chatRoom *room.Room) http.Handler {
 		userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
 		if userID == "" {
 			http.Error(w, "user_id is required\n", http.StatusBadRequest)
+			return
+		}
+		roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
+		if roomID == "" {
+			http.Error(w, "room_id is required\n", http.StatusBadRequest)
 			return
 		}
 
@@ -57,8 +63,12 @@ func newWebSocketHandler(chatRoom *room.Room) http.Handler {
 		// 后面还有一个更完整的清理 defer，负责 Leave、再次 Close 和等待写协程退出。
 		defer conn.Close()
 
-		// 让当前用户加入内存房间。
+		// 根据 room_id 找到对应的内存房间，再让当前用户加入这个房间。
 		// Join 会为这个连接创建独立的消息 channel，之后房间广播的消息都会写入这个 channel。
+		chatRoom, err := rooms.GetOrCreate(roomID)
+		if err != nil {
+			return
+		}
 		client, err := chatRoom.Join(userID)
 		if err != nil {
 			// 加入失败（例如重复 user_id）时无法继续收发消息，直接关闭连接。
@@ -136,6 +146,12 @@ func newWebSocketHandler(chatRoom *room.Room) http.Handler {
 				// 客户端关闭、网络异常或消息格式错误都会让 ReadJSON 返回错误。
 				// 此时不需要继续读，直接返回触发上面的清理逻辑。
 				return
+			}
+
+			// 限流发生在 Publish 之前，超限消息不会消耗房间序号，也不会进入广播链路。
+			// 当前协议没有定义错误帧，因此这里丢弃本条消息并保持连接继续读取。
+			if !messageLimiter.Allow(userID) {
+				continue
 			}
 
 			// 发布弹幕。如果房间为空等业务错误导致发布失败，当前连接也无法继续正常工作。
