@@ -18,3 +18,39 @@ DANMUFLOW_HTTP_ADDR=:9090 go run ./cmd/server
 
 - `GET /`：确认服务已启动
 - `GET /healthz`：健康检查
+- `GET /ws?user_id=alice`：建立 WebSocket 弹幕连接
+
+## WebSocket 使用方式
+
+启动服务后，客户端连接：
+
+```text
+ws://localhost:8080/ws?user_id=alice
+```
+
+客户端发送 JSON 弹幕：
+
+```json
+{"content":"hello"}
+```
+
+服务端会把消息广播给当前房间的在线客户端：
+
+```json
+{"sequence":1,"content":"hello"}
+```
+
+其中 `sequence` 是当前内存房间内递增的消息序号。
+
+当前版本的限制：
+
+- 房间暂时使用单个内存房间，尚未使用 `room_id` 路由；
+- 服务重启后连接和消息都会丢失；
+- 慢客户端可能丢失消息，但不会阻塞其他客户端；
+- 尚未接入 Kafka、Redis、MySQL、登录鉴权和历史消息补偿。
+
+## 验证
+
+```bash
+go test -race ./...
+```

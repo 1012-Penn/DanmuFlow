@@ -2,6 +2,8 @@ module github.com/1012-Penn/DanmuFlow
 
 go 1.26
 
+require github.com/gorilla/websocket v1.5.3
+
 require (
 	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect
