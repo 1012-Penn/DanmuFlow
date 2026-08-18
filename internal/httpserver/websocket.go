@@ -31,9 +31,9 @@ type websocketResponse struct {
 	Content  string `json:"content"`
 }
 
-// newWebSocketHandler 把一条 WebSocket 连接接到内存房间。
+// newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(chatRoom *room.Room) http.Handler {
+func newWebSocketHandler(rooms *room.Registry) http.Handler {
 	// Upgrader 负责把普通 HTTP 请求升级为 WebSocket 长连接。
 	// 这里使用零值配置，Gorilla 会执行默认的 Origin 检查，避免无意中接受任意来源的浏览器请求。
 	var upgrader websocket.Upgrader
@@ -44,6 +44,11 @@ func newWebSocketHandler(chatRoom *room.Room) http.Handler {
 		userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
 		if userID == "" {
 			http.Error(w, "user_id is required\n", http.StatusBadRequest)
+			return
+		}
+		roomID := strings.TrimSpace(r.URL.Query().Get("room_id"))
+		if roomID == "" {
+			http.Error(w, "room_id is required\n", http.StatusBadRequest)
 			return
 		}
 
@@ -57,8 +62,12 @@ func newWebSocketHandler(chatRoom *room.Room) http.Handler {
 		// 后面还有一个更完整的清理 defer，负责 Leave、再次 Close 和等待写协程退出。
 		defer conn.Close()
 
-		// 让当前用户加入内存房间。
+		// 根据 room_id 找到对应的内存房间，再让当前用户加入这个房间。
 		// Join 会为这个连接创建独立的消息 channel，之后房间广播的消息都会写入这个 channel。
+		chatRoom, err := rooms.GetOrCreate(roomID)
+		if err != nil {
+			return
+		}
 		client, err := chatRoom.Join(userID)
 		if err != nil {
 			// 加入失败（例如重复 user_id）时无法继续收发消息，直接关闭连接。

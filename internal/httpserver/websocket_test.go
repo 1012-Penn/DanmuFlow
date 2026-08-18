@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -24,11 +25,11 @@ func TestWebSocketBroadcastsToTwoClients(t *testing.T) {
 	defer server.Close()
 
 	// connect 是测试内部的辅助函数：根据 userID 建立一条 WebSocket 连接。
-	connect := func(userID string) *websocket.Conn {
+	connect := func(roomID, userID string) *websocket.Conn {
 		t.Helper()
 
-		// 把 http:// 地址改写成 ws:// 地址，并拼接 /ws 与 user_id 参数。
-		wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?user_id=" + userID
+		// 把 http:// 地址改写成 ws:// 地址，并拼接 /ws、room_id 与 user_id 参数。
+		wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?room_id=" + roomID + "&user_id=" + userID
 		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -37,10 +38,12 @@ func TestWebSocketBroadcastsToTwoClients(t *testing.T) {
 	}
 
 	// 两个客户端分别以 alice 和 bob 的身份加入同一个房间。
-	alice := connect("alice")
+	alice := connect("room-a", "alice")
 	defer alice.Close()
-	bob := connect("bob")
+	bob := connect("room-a", "bob")
 	defer bob.Close()
+	carol := connect("room-b", "carol")
+	defer carol.Close()
 
 	// alice 发送一条弹幕，服务端应该把它广播给房间里的所有客户端。
 	if err := alice.WriteJSON(websocketRequest{Content: "hello"}); err != nil {
@@ -56,5 +59,23 @@ func TestWebSocketBroadcastsToTwoClients(t *testing.T) {
 		if response.Sequence != 1 || response.Content != "hello" {
 			t.Fatalf("response = %+v", response)
 		}
+	}
+
+	// carol 在另一个房间，不应该收到 room-a 的消息。
+	_ = carol.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var response websocketResponse
+	if err := carol.ReadJSON(&response); err == nil {
+		t.Fatalf("different room received response: %+v", response)
+	}
+}
+
+func TestWebSocketRequiresRoomID(t *testing.T) {
+	request := httptest.NewRequest("GET", "/ws?user_id=alice", nil)
+	recorder := httptest.NewRecorder()
+
+	New(":0").Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != 400 {
+		t.Fatalf("status = %d, want 400", recorder.Code)
 	}
 }
