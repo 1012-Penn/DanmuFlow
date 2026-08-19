@@ -97,3 +97,45 @@ func TestShutdownNotifiesWebSocketClientToReconnect(t *testing.T) {
 		t.Fatalf("Serve() error = %v, want %v", err, http.ErrServerClosed)
 	}
 }
+
+func TestConnectionRegisteredAfterShutdownSnapshotIsRejected(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("environment does not allow local network listeners: %v", err)
+	}
+	defer listener.Close()
+
+	server := newTestServer()
+	// 模拟发布下线已经取得空连接快照，但某个请求此前已经通过 readiness 检查、
+	// 尚在完成 WebSocket Upgrade 的窗口。draining 保持 false，让测试稳定进入
+	// add 的迟到注册分支，而不依赖难以控制的真实调度时序。
+	server.connections.closeForServiceRestart(context.Background())
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+
+	wsURL := "ws://" + listener.Addr().String() + "/ws?room_id=room-a&user_id=alice"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = conn.ReadMessage()
+	closeError, ok := err.(*websocket.CloseError)
+	if !ok || closeError.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close error = %v, want WebSocket close code %d", err, websocket.CloseServiceRestart)
+	}
+
+	shutdownContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownContext); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if err := <-serveDone; !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("Serve() error = %v, want %v", err, http.ErrServerClosed)
+	}
+}
