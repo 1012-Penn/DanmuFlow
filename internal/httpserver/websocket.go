@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -63,11 +64,72 @@ type websocketErrorResponse struct {
 }
 
 const (
-	invalidJSONCode      = "invalid_json"
-	emptyContentCode     = "empty_content"
-	contentTooLongCode   = "content_too_long"
-	sensitiveContentCode = "sensitive_content"
+	invalidJSONCode           = "invalid_json"
+	emptyContentCode          = "empty_content"
+	contentTooLongCode        = "content_too_long"
+	sensitiveContentCode      = "sensitive_content"
+	messageBusUnavailableCode = "message_bus_unavailable"
 )
+
+// websocketConnections 记录当前实例上已经升级的连接。http.Server.Shutdown
+// 不会自动关闭被 WebSocket 接管的连接，因此发布重启时需要它主动发送 1012。
+type websocketConnections struct {
+	mu    sync.Mutex
+	items map[*websocket.Conn]struct{}
+}
+
+func newWebSocketConnections() *websocketConnections {
+	return &websocketConnections{items: make(map[*websocket.Conn]struct{})}
+}
+
+func (connections *websocketConnections) add(conn *websocket.Conn) {
+	connections.mu.Lock()
+	connections.items[conn] = struct{}{}
+	connections.mu.Unlock()
+}
+
+func (connections *websocketConnections) remove(conn *websocket.Conn) {
+	connections.mu.Lock()
+	delete(connections.items, conn)
+	connections.mu.Unlock()
+}
+
+// closeForServiceRestart 向所有连接发出 1012（服务重启）后关闭底层连接。
+// WriteControl 可与单独的数据帧写协程并发调用；同时并发关闭各连接，避免慢客户端
+// 让整个实例的下线时间随连接数线性增长。
+func (connections *websocketConnections) closeForServiceRestart(ctx context.Context) {
+	connections.mu.Lock()
+	items := make([]*websocket.Conn, 0, len(connections.items))
+	for conn := range connections.items {
+		items = append(items, conn)
+	}
+	connections.mu.Unlock()
+
+	var workers sync.WaitGroup
+	workers.Add(len(items))
+	for _, conn := range items {
+		conn := conn
+		go func() {
+			defer workers.Done()
+			deadline := time.Now().Add(time.Second)
+			if until, ok := ctx.Deadline(); ok && until.Before(deadline) {
+				deadline = until
+			}
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service is restarting"), deadline)
+			_ = conn.Close()
+		}()
+	}
+	finished := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-ctx.Done():
+	}
+}
 
 // protocolError 是写协程处理的一条错误响应。
 // done 用来让读协程确认错误已经写入，避免读协程立刻关闭连接导致错误帧丢失。
@@ -78,7 +140,7 @@ type protocolError struct {
 
 // newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, messageBus bus.Bus, observability *metrics.Metrics, logger *zap.Logger) http.Handler {
+func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, messageBus bus.Bus, canAcceptConnection func() bool, canPublish func() bool, connections *websocketConnections, observability *metrics.Metrics, logger *zap.Logger) http.Handler {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -88,6 +150,11 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 	var upgrader websocket.Upgrader
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 就绪失败时先拒绝升级，避免客户端建立一条“能连上但不能安全发送”的连接。
+		if !canAcceptConnection() {
+			http.Error(w, "message bus is temporarily unavailable\n", http.StatusServiceUnavailable)
+			return
+		}
 		// 1. 在 Upgrade 之前校验 user_id。
 		//    Upgrade 成功后 HTTP 响应已经变成 WebSocket 帧，不能再用 http.Error 返回 400。
 		userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
@@ -130,6 +197,8 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			logger.Debug("websocket_rejected", zap.String("reason", "join_room_failed"), zap.String("room_id", roomID), zap.String("user_id", userID), zap.Error(err))
 			return
 		}
+		connections.add(conn)
+		defer connections.remove(conn)
 		observability.WebSocketConnections.Inc()
 		defer observability.WebSocketConnections.Dec()
 
@@ -332,6 +401,19 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				continue
 			}
 
+			// 消费者在连接存续期间失去就绪状态时，不再接收新消息。这样 Kafka
+			// 虽可能仍可写入，客户端也不会误以为弹幕已经被正常广播。
+			if !canPublish() {
+				observability.MessagesRejected.WithLabelValues(messageBusUnavailableCode).Inc()
+				if !queueProtocolError(websocketErrorResponse{
+					Code:    messageBusUnavailableCode,
+					Message: "message queue is temporarily unavailable",
+				}) {
+					return
+				}
+				continue
+			}
+
 			danmaku := message.Danmaku{
 				MessageID: strconv.FormatUint(nextMessageID(), 10),
 				RoomID:    roomID,
@@ -345,14 +427,14 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			observability.KafkaPublishDuration.Observe(time.Since(publishedAt).Seconds())
 			cancelPublish()
 			if err != nil {
-				observability.MessagesRejected.WithLabelValues("message_bus_unavailable").Inc()
+				observability.MessagesRejected.WithLabelValues(messageBusUnavailableCode).Inc()
 				logger.Debug("message_publish_rejected", append(connectionFields,
 					zap.String("reason", "message_bus_unavailable"),
 					zap.String("message_id", danmaku.MessageID),
 					zap.Error(err),
 				)...)
 				if !queueProtocolError(websocketErrorResponse{
-					Code:    "message_bus_unavailable",
+					Code:    messageBusUnavailableCode,
 					Message: "message queue is temporarily unavailable",
 				}) {
 					return

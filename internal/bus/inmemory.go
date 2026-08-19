@@ -78,5 +78,17 @@ func (b *InMemoryBus) Consume(ctx context.Context, handler Handler) error {
 	}
 }
 
+// ConsumerReady 对进程内总线始终为 true：它没有外部消费组需要加入。
+// 这让本地开发和 HTTP 单元测试拥有与生产环境相同的就绪检查边界。
+func (b *InMemoryBus) ConsumerReady() bool {
+	return b != nil
+}
+
+// Check 对进程内总线不需要访问外部依赖，因此总是成功。
+func (b *InMemoryBus) Check(context.Context) error {
+	return nil
+}
+
 // Compile-time check: InMemoryBus 必须始终满足后续 KafkaBus 也会使用的 Bus 接口。
 var _ Bus = (*InMemoryBus)(nil)
+var _ Readiness = (*InMemoryBus)(nil)

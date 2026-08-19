@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/1012-Penn/DanmuFlow/internal/httpserver"
 	"github.com/1012-Penn/DanmuFlow/internal/logging"
@@ -38,10 +44,26 @@ func main() {
 	}
 	logger.Info("http_server_started", zap.String("addr", addr))
 
-	// ListenAndServe 会一直阻塞，直到服务被关闭或发生致命错误。
-	// 因此这里放在 main 的最后；一旦返回，程序就退出。
-	if err := srv.ListenAndServe(); err != nil {
-		logger.Error("http_server_stopped", zap.Error(err))
-		return
+	// 收到容器停止或 Ctrl+C 后，最多用 10 秒执行发布下线：/readyz 先失败，
+	// 已连接客户端收到 WebSocket 1012，再停止 Kafka 消费和 HTTP listener。
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	serveErrors := make(chan error, 1)
+	go func() {
+		serveErrors <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-signalContext.Done():
+		logger.Info("http_server_shutdown_started")
+		shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelShutdown()
+		if err := srv.Shutdown(shutdownContext); err != nil {
+			logger.Error("http_server_shutdown_failed", zap.Error(err))
+		}
+	case err := <-serveErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("http_server_stopped", zap.Error(err))
+		}
 	}
 }
