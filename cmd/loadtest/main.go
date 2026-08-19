@@ -45,9 +45,13 @@ type stats struct {
 	sent          int
 	received      int
 	selfDelivered int
-	writeErrors   int
-	readErrors    int
-	latencies     []time.Duration
+	// deliveredMessageIDs 只记录发送者自己的唯一回显。Kafka 至少一次投递在
+	// 故障恢复时可能重放同一条消息，重复回显不能被错误算作送达成功。
+	deliveredMessageIDs    map[string]struct{}
+	duplicateSelfDelivered int
+	writeErrors            int
+	readErrors             int
+	latencies              []time.Duration
 }
 
 func main() {
@@ -105,7 +109,10 @@ func validateConfig(config config) error {
 
 func connectClients(ctx context.Context, config config) ([]*websocket.Conn, *stats, func(), error) {
 	clients := make([]*websocket.Conn, 0, config.connections)
-	results := &stats{latencies: make([]time.Duration, 0, config.rate*int(config.duration/time.Second))}
+	results := &stats{
+		latencies:           make([]time.Duration, 0, config.rate*int(config.duration/time.Second)),
+		deliveredMessageIDs: make(map[string]struct{}),
+	}
 
 	for clientIndex := range config.connections {
 		roomID := fmt.Sprintf("load-room-%d", clientIndex%config.rooms)
@@ -187,11 +194,24 @@ func readMessages(conn *websocket.Conn, userID string, results *stats) {
 			continue
 		}
 
-		results.mu.Lock()
-		results.selfDelivered++
-		results.latencies = append(results.latencies, time.Since(time.Unix(0, sentAt)))
-		results.mu.Unlock()
+		results.recordSelfDelivery(message.Content, time.Unix(0, sentAt))
 	}
+}
+
+// recordSelfDelivery 记录发送者收到自己消息的第一次回显。
+// 同一个消息 ID 的后续回显说明消费链发生了重复投递，只增加重复计数，不再提升
+// 送达率或改变首次到达延迟。这个方法自行加锁，读协程可并发调用。
+func (results *stats) recordSelfDelivery(messageID string, sentAt time.Time) {
+	results.mu.Lock()
+	defer results.mu.Unlock()
+
+	if _, seen := results.deliveredMessageIDs[messageID]; seen {
+		results.duplicateSelfDelivered++
+		return
+	}
+	results.deliveredMessageIDs[messageID] = struct{}{}
+	results.selfDelivered++
+	results.latencies = append(results.latencies, time.Since(sentAt))
 }
 
 func printReport(elapsed time.Duration, results *stats) {
@@ -206,7 +226,7 @@ func printReport(elapsed time.Duration, results *stats) {
 		deliveryRate = float64(results.selfDelivered) / float64(results.sent) * 100
 	}
 
-	log.Printf("load test finished: elapsed=%s sent=%d self_delivered=%d delivery_rate=%.2f%% received_total=%d write_errors=%d read_errors=%d", elapsed.Round(time.Millisecond), results.sent, results.selfDelivered, deliveryRate, results.received, results.writeErrors, results.readErrors)
+	log.Printf("load test finished: elapsed=%s sent=%d self_delivered=%d duplicate_self_delivered=%d delivery_rate=%.2f%% received_total=%d write_errors=%d read_errors=%d", elapsed.Round(time.Millisecond), results.sent, results.selfDelivered, results.duplicateSelfDelivered, deliveryRate, results.received, results.writeErrors, results.readErrors)
 	if len(results.latencies) == 0 {
 		log.Print("latency: no sender echo was received")
 		return

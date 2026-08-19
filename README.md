@@ -160,7 +160,7 @@ go test -race ./...
 
 ## 基线压测
 
-`cmd/loadtest` 会建立指定数量的 WebSocket 连接，均匀分配到多个房间，并统计发送者收到自身弹幕回显的端到端延迟。压测期间可通过 `/metrics` 观察服务端的发布、消费和慢客户端指标：
+`cmd/loadtest` 会建立指定数量的 WebSocket 连接，均匀分配到多个房间，并统计发送者收到自身弹幕回显的端到端延迟。报告中的 `self_delivered` 是按消息 ID 去重后的唯一回显数，`duplicate_self_delivered` 是重复回显数；两者分开后，Kafka 故障恢复时的重复投递不会被误算成送达成功。压测期间可通过 `/metrics` 观察服务端的发布、消费和慢客户端指标：
 
 ```bash
 go run ./cmd/loadtest \

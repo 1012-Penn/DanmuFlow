@@ -22,6 +22,14 @@ var (
 	ErrKafkaBusClosed = errors.New("kafka bus is closed")
 )
 
+const (
+	consumerGroupJoinTimeout      = 5 * time.Second
+	consumerGroupRequestTimeout   = 3 * time.Second
+	consumerGroupRebalanceTimeout = 5 * time.Second
+	consumerGroupSessionTimeout   = 10 * time.Second
+	consumerGroupJoinBackoff      = 100 * time.Millisecond
+)
+
 // KafkaConfig 描述 KafkaBus 连接 Kafka 所需的最小配置。
 // Brokers、Topic 和 GroupID 分别决定连接地址、消息主题和消费者组身份。
 type KafkaConfig struct {
@@ -116,9 +124,13 @@ func (b *KafkaBus) Consume(ctx context.Context, handler Handler) error {
 	}
 
 	group, err := kafka.NewConsumerGroup(kafka.ConsumerGroupConfig{
-		ID:      b.config.GroupID,
-		Brokers: b.config.Brokers,
-		Topics:  []string{b.config.Topic},
+		ID:               b.config.GroupID,
+		Brokers:          b.config.Brokers,
+		Topics:           []string{b.config.Topic},
+		Timeout:          consumerGroupRequestTimeout,
+		RebalanceTimeout: consumerGroupRebalanceTimeout,
+		SessionTimeout:   consumerGroupSessionTimeout,
+		JoinGroupBackoff: consumerGroupJoinBackoff,
 	})
 	if err != nil {
 		return err
@@ -144,7 +156,13 @@ func (b *KafkaBus) Consume(ctx context.Context, handler Handler) error {
 
 	for {
 		b.consumerReady.Store(false)
-		generation, err := group.Next(ctx)
+		// ConsumerGroup.Next 在 Kafka 协调器异常时可能一直等不到下一代。若让它
+		// 使用整个服务生命周期的 ctx，就会把上层的指数退避监督循环永久卡住。
+		// 每次加入或重加入组最多等待 5 秒；超时后返回给监督循环，由它关闭本次
+		// group 并创建新的连接尝试，而不是假装消费者仍在恢复。
+		joinContext, cancelJoin := context.WithTimeout(ctx, consumerGroupJoinTimeout)
+		generation, err := group.Next(joinContext)
+		cancelJoin()
 		if err != nil {
 			return err
 		}
