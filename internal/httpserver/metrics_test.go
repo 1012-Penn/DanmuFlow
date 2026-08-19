@@ -30,6 +30,8 @@ func TestMetricsEndpointExposesBaselineMetrics(t *testing.T) {
 		"danmuflow_consumer_handler_duration_seconds",
 		"danmuflow_room_client_messages_dropped_total",
 		"danmuflow_consumer_running",
+		"danmuflow_consumer_ready",
+		"danmuflow_consumer_restarts_total",
 		"go_goroutines",
 	} {
 		if !strings.Contains(body, metricName) {

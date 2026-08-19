@@ -64,8 +64,9 @@ go test -tags=integration ./internal/bus -run TestKafkaBusEndToEndPreservesRoomO
 ## 可用端点
 
 - `GET /`：确认服务已启动
-- `GET /healthz`：健康检查
-- `GET /metrics`：Prometheus 指标抓取端点，包含连接数、消息拒绝原因、Kafka 发布和消费处理耗时、慢客户端丢弃数与 Go 运行时指标
+- `GET /healthz`：进程存活检查
+- `GET /readyz`：流量就绪检查；要求已加入 Kafka 消费组、生产端可连接 Kafka，且未处于发布下线过程。负载均衡应使用此端点
+- `GET /metrics`：Prometheus 指标抓取端点，包含连接数、消息拒绝原因、Kafka 发布和消费处理耗时、消费者就绪/重启次数、慢客户端丢弃数与 Go 运行时指标
 - `GET /ws?room_id=room-a&user_id=alice`：建立指定房间的 WebSocket 弹幕连接（`room_id`、`user_id` 缺一不可，缺失时返回 HTTP 400）
 
 ## WebSocket 使用方式
@@ -132,7 +133,7 @@ ws://localhost:8080/ws?room_id=room-a&user_id=alice
 - 每个 `user_id` 默认每秒允许 5 条弹幕、最多突发 10 条，超限消息被丢弃；
 - 单条 WebSocket 数据帧最大 4 KiB，弹幕正文最多 500 个字符；
 - 默认拦截 `赌博` 和 `诈骗` 等敏感词，命中后不广播、不消耗房间序号；
-- 服务重启后连接和消息都会丢失；
+- 服务重启时，在线连接会收到 WebSocket `1012`（服务重启）并需要客户端重连；未持久化的在途消息仍可能丢失；
 - 慢客户端可能丢失自己的消息，但不会阻塞房间内其他客户端；
 - 生产入口已接入 Kafka；房间路由仍只存在于单个进程内存中，尚未使用 Redis 或其他共享存储；
 - 单元测试使用 InMemoryBus，不要求测试环境运行 Kafka；

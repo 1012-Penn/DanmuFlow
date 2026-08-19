@@ -22,6 +22,8 @@ type Metrics struct {
 	ConsumerHandlerDuration   prometheus.Histogram
 	RoomClientMessagesDropped prometheus.Counter
 	ConsumerRunning           prometheus.Gauge
+	ConsumerReady             prometheus.Gauge
+	ConsumerRestarts          prometheus.Counter
 }
 
 // New 创建一组尚未暴露给外部的指标。
@@ -62,6 +64,14 @@ func New() *Metrics {
 			Name: "danmuflow_consumer_running",
 			Help: "Whether this instance currently has a running message bus consumer (1=true, 0=false).",
 		}),
+		ConsumerReady: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "danmuflow_consumer_ready",
+			Help: "Whether this instance has successfully joined the current Kafka consumer-group generation (1=true, 0=false).",
+		}),
+		ConsumerRestarts: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "danmuflow_consumer_restarts_total",
+			Help: "Total consumer restart attempts after unexpected consumption failures.",
+		}),
 	}
 
 	registry.MustRegister(
@@ -72,6 +82,8 @@ func New() *Metrics {
 		metrics.ConsumerHandlerDuration,
 		metrics.RoomClientMessagesDropped,
 		metrics.ConsumerRunning,
+		metrics.ConsumerReady,
+		metrics.ConsumerRestarts,
 		prometheus.NewGoCollector(),
 	)
 

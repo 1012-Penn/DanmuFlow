@@ -21,3 +21,12 @@ type Bus interface {
 	// Consume 持续消费消息并交给 handler 处理。
 	Consume(ctx context.Context, handler Handler) error
 }
+
+// Readiness 是消息总线可选提供的运行状态接口。
+// ConsumerReady 表示消费者已经成功加入消费组并拿到当前 generation；Check
+// 用于确认生产端仍能与 Kafka 建立连接。HTTP 网关同时依赖两者，避免把“进程还在”
+// 错当成“可以安全接收新弹幕”。
+type Readiness interface {
+	ConsumerReady() bool
+	Check(ctx context.Context) error
+}

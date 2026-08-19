@@ -60,6 +60,24 @@ func TestKafkaBusEndToEndPreservesRoomOrder(t *testing.T) {
 			return nil
 		})
 	}()
+	readyDeadline := time.Now().Add(10 * time.Second)
+	for !messageBus.ConsumerReady() {
+		if time.Now().After(readyDeadline) {
+			t.Fatal("consumer did not become ready after joining the Kafka consumer group")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 不可解析的 JSON 是永久性坏消息：消费者应记录、提交并跳过它，随后继续
+	// 处理同一个 Topic 上的合法弹幕，而不是反复在同一个 offset 崩溃。
+	poisonWriter := &kafka.Writer{Addr: kafka.TCP(config.Brokers...), Topic: config.Topic}
+	if err := poisonWriter.WriteMessages(consumeContext, kafka.Message{Value: []byte("not-json")}); err != nil {
+		_ = poisonWriter.Close()
+		t.Fatal(err)
+	}
+	if err := poisonWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	for sequence := uint64(1); sequence <= 3; sequence++ {
 		if err := messageBus.Publish(consumeContext, message.Danmaku{
