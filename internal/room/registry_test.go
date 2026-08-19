@@ -45,7 +45,7 @@ func TestRegistryKeepsDifferentRoomsIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := roomA.Publish("hello"); err != nil {
+	if _, err := roomA.Publish("hello"); err != nil {
 		t.Fatal(err)
 	}
 

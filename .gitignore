@@ -1,3 +1,6 @@
 .project-notes/
 .dsh-tools/
+.dsh/
+dsh-web-ui-all-*/
+dsh-backup-*.tar.gz
 CLAUDE.md

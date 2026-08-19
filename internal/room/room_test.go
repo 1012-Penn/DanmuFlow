@@ -17,7 +17,7 @@ func TestClientsInSameRoomReceivePublishedMessage(t *testing.T) {
 	}
 
 	// 发布第一条消息后，alice 和 bob 都应该收到，且序号为 1。
-	if err := r.Publish("hello"); err != nil {
+	if _, err := r.Publish("hello"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -29,7 +29,7 @@ func TestClientsInSameRoomReceivePublishedMessage(t *testing.T) {
 	}
 
 	// 再发布第二条消息，验证序号继续递增到 2。
-	if err := r.Publish("world"); err != nil {
+	if _, err := r.Publish("world"); err != nil {
 		t.Fatal(err)
 	}
 	for _, client := range []*Client{alice, bob} {
@@ -59,7 +59,7 @@ func TestLeaveStopsClientFromReceivingMessages(t *testing.T) {
 	}
 
 	// 广播一条消息，只有仍在房间里的 bob 能收到。
-	if err := r.Publish("hello"); err != nil {
+	if _, err := r.Publish("hello"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -86,7 +86,7 @@ func TestRoomRejectsEmptyInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Publish("\t"); err != ErrEmptyContent {
+	if _, err := r.Publish("\t"); err != ErrEmptyContent {
 		t.Fatalf("Publish error = %v, want %v", err, ErrEmptyContent)
 	}
 	select {
@@ -109,7 +109,7 @@ func TestSlowClientDoesNotBlockOtherClients(t *testing.T) {
 	}
 
 	// 第一条消息先填满两个客户端各自容量为 1 的 channel。
-	if err := r.Publish("first"); err != nil {
+	if _, err := r.Publish("first"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -119,8 +119,12 @@ func TestSlowClientDoesNotBlockOtherClients(t *testing.T) {
 	}
 
 	// 第二次 Publish 不应被 Alice 的满 channel 卡住，Bob 仍然应该收到第二条消息。
-	if err := r.Publish("second"); err != nil {
+	result, err := r.Publish("second")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.DroppedClients != 1 {
+		t.Fatalf("dropped clients = %d, want 1", result.DroppedClients)
 	}
 	if message := <-bob.Messages; message.Content != "second" {
 		t.Fatalf("bob received %q, want %q", message.Content, "second")

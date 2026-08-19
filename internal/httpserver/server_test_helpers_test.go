@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/1012-Penn/DanmuFlow/internal/bus"
+	"github.com/1012-Penn/DanmuFlow/internal/metrics"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"go.uber.org/zap"
 )
@@ -17,5 +18,6 @@ func newTestServer() *http.Server {
 	}
 
 	rooms := room.NewRegistry()
-	return newServerWithBus(":0", rooms, messageBus, startMessageBusConsumer(rooms, messageBus, zap.NewNop()), zap.NewNop())
+	observability := metrics.New()
+	return newServerWithBus(":0", rooms, messageBus, startMessageBusConsumer(rooms, messageBus, observability, zap.NewNop()), observability, zap.NewNop())
 }

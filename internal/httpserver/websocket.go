@@ -13,6 +13,7 @@ import (
 
 	"github.com/1012-Penn/DanmuFlow/internal/bus"
 	"github.com/1012-Penn/DanmuFlow/internal/message"
+	"github.com/1012-Penn/DanmuFlow/internal/metrics"
 	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"github.com/1012-Penn/DanmuFlow/internal/sensitive"
@@ -77,7 +78,7 @@ type protocolError struct {
 
 // newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, messageBus bus.Bus, logger *zap.Logger) http.Handler {
+func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, messageBus bus.Bus, observability *metrics.Metrics, logger *zap.Logger) http.Handler {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -129,6 +130,8 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			logger.Debug("websocket_rejected", zap.String("reason", "join_room_failed"), zap.String("room_id", roomID), zap.String("user_id", userID), zap.Error(err))
 			return
 		}
+		observability.WebSocketConnections.Inc()
+		defer observability.WebSocketConnections.Dec()
 
 		connectedAt := time.Now()
 		connectionFields := []zap.Field{
@@ -249,6 +252,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				// 超大帧由 Gorilla 发送 1009 关闭帧；其他读取错误通常表示
 				// 客户端断开或 JSON 语法错误。ReadMessage 出错后不能继续复用读循环。
 				if errors.Is(err, websocket.ErrReadLimit) {
+					observability.MessagesRejected.WithLabelValues("frame_too_large").Inc()
 					logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "frame_too_large"))...)
 					// Gorilla 已经发出 1009 关闭帧。短暂读取剩余数据，等待
 					// 客户端的关闭回应，避免底层 TCP 连接在关闭帧送达前因为
@@ -260,17 +264,18 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 						}
 					}
 				} else if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					// ReadMessage 在底层连接中断或客户端未完成关闭握手时也会返回错误，
+					// 但此时没有收到可供 JSON 校验的完整数据帧，不能误记为 invalid_json。
+					// 连接已经无法继续读取，记录调试日志后直接清理即可。
 					logger.Debug("websocket_read_failed", append(connectionFields, zap.Error(err))...)
-					_ = queueProtocolError(websocketErrorResponse{
-						Code:    invalidJSONCode,
-						Message: "message must be valid JSON",
-					})
 				}
 				return
 			}
+			observability.MessagesReceived.Inc()
 
 			var request websocketRequest
 			if err := json.Unmarshal(payload, &request); err != nil {
+				observability.MessagesRejected.WithLabelValues("invalid_json").Inc()
 				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "invalid_json"))...)
 				// JSON 语法错误与 ReadMessage 阶段的读取错误一样会结束连接，
 				// 发送错误帧后退出读循环。queueProtocolError 会等待错误帧
@@ -286,6 +291,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			// 这里不修改合法正文本身，因此原有广播内容行为保持不变。
 			switch {
 			case strings.TrimSpace(request.Content) == "":
+				observability.MessagesRejected.WithLabelValues("empty_content").Inc()
 				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "empty_content"))...)
 				if !queueProtocolError(websocketErrorResponse{
 					Code:    emptyContentCode,
@@ -295,6 +301,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				}
 				continue
 			case utf8.RuneCountInString(request.Content) > maxContentRunes:
+				observability.MessagesRejected.WithLabelValues("content_too_long").Inc()
 				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "content_too_long"))...)
 				if !queueProtocolError(websocketErrorResponse{
 					Code:    contentTooLongCode,
@@ -305,6 +312,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				continue
 			}
 			if _, matched := sensitiveFilter.Match(request.Content); matched {
+				observability.MessagesRejected.WithLabelValues("sensitive_content").Inc()
 				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "sensitive_content"))...)
 				if !queueProtocolError(websocketErrorResponse{
 					Code:    sensitiveContentCode,
@@ -319,6 +327,7 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			// 也不会消耗房间序号。
 			// 限流暂时不返回错误帧，客户端保持连接并继续发送后续消息。
 			if !messageLimiter.Allow(userID) {
+				observability.MessagesRejected.WithLabelValues("rate_limit").Inc()
 				logger.Debug("message_rejected", append(connectionFields, zap.String("reason", "rate_limit"))...)
 				continue
 			}
@@ -331,9 +340,12 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				CreatedAt: time.Now(),
 			}
 			publishContext, cancelPublish := context.WithTimeout(r.Context(), messageBusPublishWait)
+			publishedAt := time.Now()
 			err = messageBus.Publish(publishContext, danmaku)
+			observability.KafkaPublishDuration.Observe(time.Since(publishedAt).Seconds())
 			cancelPublish()
 			if err != nil {
+				observability.MessagesRejected.WithLabelValues("message_bus_unavailable").Inc()
 				logger.Debug("message_publish_rejected", append(connectionFields,
 					zap.String("reason", "message_bus_unavailable"),
 					zap.String("message_id", danmaku.MessageID),
