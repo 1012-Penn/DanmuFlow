@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/1012-Penn/DanmuFlow/internal/message"
+	"github.com/1012-Penn/DanmuFlow/internal/metrics"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"go.uber.org/zap"
 )
@@ -21,7 +22,7 @@ func TestInMemoryMessageBusRoutesMessageToRoom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messageBus, cancelConsumer, err := newInMemoryMessageBus(rooms, zap.NewNop())
+	messageBus, cancelConsumer, err := newInMemoryMessageBus(rooms, metrics.New(), zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}

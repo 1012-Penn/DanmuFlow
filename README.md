@@ -65,6 +65,7 @@ go test -tags=integration ./internal/bus -run TestKafkaBusEndToEndPreservesRoomO
 
 - `GET /`：确认服务已启动
 - `GET /healthz`：健康检查
+- `GET /metrics`：Prometheus 指标抓取端点，包含连接数、消息拒绝原因、Kafka 发布和消费处理耗时、慢客户端丢弃数与 Go 运行时指标
 - `GET /ws?room_id=room-a&user_id=alice`：建立指定房间的 WebSocket 弹幕连接（`room_id`、`user_id` 缺一不可，缺失时返回 HTTP 400）
 
 ## WebSocket 使用方式
@@ -155,3 +156,18 @@ internal/logging/        结构化日志（zap）初始化
 ```bash
 go test -race ./...
 ```
+
+## 基线压测
+
+`cmd/loadtest` 会建立指定数量的 WebSocket 连接，均匀分配到多个房间，并统计发送者收到自身弹幕回显的端到端延迟。压测期间可通过 `/metrics` 观察服务端的发布、消费和慢客户端指标：
+
+```bash
+go run ./cmd/loadtest \
+  -url ws://localhost:8080/ws \
+  -connections 100 \
+  -rooms 10 \
+  -rate 100 \
+  -duration 5m
+```
+
+压测工具的 `rate` 是所有连接合计的每秒发送数。应让单个用户的发送速率低于当前每秒 5 条的限流阈值，除非实验目的就是测试限流行为。

@@ -24,6 +24,13 @@ type Message struct {
 	Content string
 }
 
+// PublishResult 描述一次房间广播的结果。
+// DroppedClients 表示因为各自待发送队列已满而没有收到本条消息的客户端数；它不影响
+// 其他客户端接收消息，也不会让房间广播阻塞。
+type PublishResult struct {
+	DroppedClients int
+}
+
 // Client 是加入房间后得到的消息管道。
 // 当前最小单元中，Room 负责向 Messages 写入消息，调用方负责从中读取消息。
 type Client struct {
@@ -99,19 +106,19 @@ func (r *Room) Leave(clientID string) error {
 	return nil
 }
 
-// Publish 给房间里的每个客户端发送一条弹幕。
-func (r *Room) Publish(content string) error {
+// Publish 给房间里的每个客户端发送一条弹幕，并返回本次广播的投递结果。
+func (r *Room) Publish(content string) (PublishResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	// 空白弹幕没有业务意义，先拒绝，避免它进入房间广播链路。
 	if strings.TrimSpace(content) == "" {
-		return ErrEmptyContent
+		return PublishResult{}, ErrEmptyContent
 	}
 
 	// 房间没有客户端时没有广播目标，返回错误让调用方感知。
 	if len(r.clients) == 0 {
-		return ErrNoClient
+		return PublishResult{}, ErrNoClient
 	}
 
 	// 先递增序号，保证同房间内每条消息都有一个单调递增的编号。
@@ -120,6 +127,7 @@ func (r *Room) Publish(content string) error {
 
 	// 遍历当前所有客户端，把同一条消息尝试写入各自的 channel。
 	// 这里在锁内发送，是为了避免 Leave 同时删除并关闭 channel 造成向已关闭 channel 写入。
+	result := PublishResult{}
 	for _, client := range r.clients {
 		select {
 		case client.Messages <- message:
@@ -127,7 +135,8 @@ func (r *Room) Publish(content string) error {
 		default:
 			// channel 已满，说明客户端消费速度跟不上广播速度。
 			// 只丢弃这个慢客户端的当前消息，不阻塞其他客户端。
+			result.DroppedClients++
 		}
 	}
-	return nil
+	return result, nil
 }

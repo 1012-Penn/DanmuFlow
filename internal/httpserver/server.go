@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/1012-Penn/DanmuFlow/internal/bus"
+	"github.com/1012-Penn/DanmuFlow/internal/metrics"
 	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
 	"github.com/1012-Penn/DanmuFlow/internal/sensitive"
@@ -43,17 +44,18 @@ func NewWithKafka(addr string, kafkaConfig bus.KafkaConfig, logger *zap.Logger) 
 	}
 
 	rooms := room.NewRegistry()
-	messageBus, cancelConsumer, err := newKafkaMessageBus(rooms, kafkaConfig, logger.Named("message_bus"))
+	observability := metrics.New()
+	messageBus, cancelConsumer, err := newKafkaMessageBus(rooms, kafkaConfig, observability, logger.Named("message_bus"))
 	if err != nil {
 		return nil, err
 	}
 
-	return newServerWithBus(addr, rooms, messageBus, cancelConsumer, logger), nil
+	return newServerWithBus(addr, rooms, messageBus, cancelConsumer, observability, logger), nil
 }
 
 // newServerWithBus 构造共享路由和 WebSocket 处理器。
 // messageBus 由调用方注入，使生产环境可以使用 Kafka，单元测试可以使用 InMemoryBus。
-func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, cancelConsumer func(), logger *zap.Logger) *http.Server {
+func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, cancelConsumer func(), observability *metrics.Metrics, logger *zap.Logger) *http.Server {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -70,7 +72,7 @@ func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, can
 	// 第一版词库先以内存配置注入，后续可以替换为配置文件或 Redis，
 	// 而不需要改变 WebSocket 处理器和过滤器的调用方式。
 	sensitiveFilter := sensitive.New([]string{"赌博", "诈骗"})
-	websocketHandler := newWebSocketHandler(rooms, messageLimiter, sensitiveFilter, messageBus, logger.Named("websocket"))
+	websocketHandler := newWebSocketHandler(rooms, messageLimiter, sensitiveFilter, messageBus, observability, logger.Named("websocket"))
 
 	// 根路径用于快速确认服务已经启动。
 	router.GET("/", func(c *gin.Context) {
@@ -81,6 +83,8 @@ func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, can
 	router.GET("/healthz", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok\n")
 	})
+	// /metrics 供 Prometheus 定期抓取，不参与 WebSocket 升级与业务路由。
+	router.GET("/metrics", gin.WrapH(observability.Handler()))
 
 	// /ws 是弹幕客户端的长连接入口。
 	// 这里把 Gin 的 ResponseWriter 和 Request 直接交给 WebSocket 处理器，
