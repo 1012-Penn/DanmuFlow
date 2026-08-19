@@ -1,12 +1,21 @@
 # DanmuFlow
 
-DanmuFlow 是一个使用 Go 构建的高并发直播间弹幕系统。当前处于**单进程内存 MVP** 阶段：已经完整跑通「客户端连接 → 发送弹幕 → 房间广播」的最小闭环，Kafka / Redis / MySQL 等基础设施尚未接入。
+DanmuFlow 是一个使用 Go 构建的高并发直播间弹幕系统。当前已经跑通「客户端连接 → Kafka → 房间广播」的最小闭环；房间和 WebSocket 连接仍然保存在单个进程内存中。
 
 ## 环境要求
 
 - Go 1.26+
 
 ## 本地运行
+
+先启动 Kafka 和默认 Topic：
+
+```bash
+docker compose up -d
+docker compose ps
+```
+
+确认 Kafka 健康后，再启动 DanmuFlow：
 
 ```bash
 go run ./cmd/server
@@ -20,12 +29,37 @@ go run ./cmd/server
 | --- | --- | --- |
 | `DANMUFLOW_HTTP_ADDR` | `:8080` | HTTP 服务监听地址 |
 | `DANMUFLOW_LOG_LEVEL` | `info` | 日志等级：`debug` / `info` / `warn` / `error` |
+| `DANMUFLOW_KAFKA_BROKERS` | `localhost:9092` | Kafka Broker 地址，多个地址用逗号分隔 |
+| `DANMUFLOW_KAFKA_TOPIC` | `danmaku` | 弹幕 Topic |
+| `DANMUFLOW_KAFKA_GROUP_ID` | `danmuflow-broadcast` | 房间广播消费者组 |
 
 日志默认以 JSON 格式输出到标准输出，便于 Docker / Kubernetes / 日志采集器统一收集：
 
 ```bash
-DANMUFLOW_HTTP_ADDR=:9090 DANMUFLOW_LOG_LEVEL=debug go run ./cmd/server
+DANMUFLOW_HTTP_ADDR=:9090 \
+DANMUFLOW_KAFKA_BROKERS=localhost:9092 \
+DANMUFLOW_LOG_LEVEL=debug \
+go run ./cmd/server
 ```
+
+启动 Kafka 后，首次运行可以使用默认的 `danmaku` Topic 和 `danmuflow-broadcast` 消费者组。Kafka 客户端使用惰性连接，服务启动时不会主动验证 Broker；发送或消费消息时如果 Kafka 不可用，日志会记录网络错误，WebSocket 发布会返回 `message_bus_unavailable`。
+
+Kafka Producer 使用 `RequireOne` 确认级别和 10ms 批次等待：正常低流量消息不会因为默认的 1 秒攒批窗口卡住，但在 Broker leader 尚未完成副本同步前发生故障时，极少量消息可能丢失。这个取舍符合弹幕场景的低延迟优先目标；需要更强持久性时可改回 `RequireAll`。
+
+停止本地 Kafka：
+
+```bash
+docker compose down
+```
+
+运行真实 Kafka 集成测试：
+
+```bash
+DANMUFLOW_KAFKA_BROKERS=localhost:9092 \
+go test -tags=integration ./internal/bus -run TestKafkaBusEndToEndPreservesRoomOrder -v
+```
+
+普通 `go test ./...` 不会连接 Kafka；集成测试通过 `integration` build tag 单独运行。
 
 ## 可用端点
 
@@ -99,7 +133,9 @@ ws://localhost:8080/ws?room_id=room-a&user_id=alice
 - 默认拦截 `赌博` 和 `诈骗` 等敏感词，命中后不广播、不消耗房间序号；
 - 服务重启后连接和消息都会丢失；
 - 慢客户端可能丢失自己的消息，但不会阻塞房间内其他客户端；
-- 当前已接入进程内 InMemoryBus，但尚未接入 Kafka、Redis、MySQL、登录鉴权和历史消息补偿。
+- 生产入口已接入 Kafka；房间路由仍只存在于单个进程内存中，尚未使用 Redis 或其他共享存储；
+- 单元测试使用 InMemoryBus，不要求测试环境运行 Kafka；
+- 尚未接入 MySQL、登录鉴权和历史消息补偿。
 
 ## 项目结构
 
@@ -108,7 +144,7 @@ cmd/server/              服务启动入口
 internal/httpserver/     HTTP/WebSocket 网关层
 internal/room/           内存房间模型（房间注册、成员、序号、广播）
 internal/message/        跨组件弹幕消息模型
-internal/bus/             消息总线抽象和 InMemoryBus
+internal/bus/             消息总线抽象、InMemoryBus 和 KafkaBus
 internal/ratelimit/      按 user_id 维度的令牌桶限流器
 internal/sensitive/      内存敏感词过滤
 internal/logging/        结构化日志（zap）初始化

@@ -19,7 +19,7 @@ func TestWebSocketBroadcastsToTwoClients(t *testing.T) {
 	}
 
 	// 使用 httptest 启动一个真实的 HTTP 服务，这样 WebSocket 的升级过程也会被完整覆盖。
-	server := httptest.NewUnstartedServer(New(":0").Handler)
+	server := httptest.NewUnstartedServer(newTestServer().Handler)
 	server.Listener = listener
 	server.Start()
 	defer server.Close()
@@ -73,7 +73,7 @@ func TestWebSocketRequiresRoomID(t *testing.T) {
 	request := httptest.NewRequest("GET", "/ws?user_id=alice", nil)
 	recorder := httptest.NewRecorder()
 
-	New(":0").Handler.ServeHTTP(recorder, request)
+	newTestServer().Handler.ServeHTTP(recorder, request)
 
 	if recorder.Code != 400 {
 		t.Fatalf("status = %d, want 400", recorder.Code)
@@ -86,7 +86,7 @@ func TestWebSocketRejectsInvalidContentAndKeepsConnection(t *testing.T) {
 		t.Skipf("environment does not allow local network listeners: %v", err)
 	}
 
-	server := httptest.NewUnstartedServer(New(":0").Handler)
+	server := httptest.NewUnstartedServer(newTestServer().Handler)
 	server.Listener = listener
 	server.Start()
 	defer server.Close()
@@ -127,7 +127,7 @@ func TestWebSocketRejectsOverlongContent(t *testing.T) {
 		t.Skipf("environment does not allow local network listeners: %v", err)
 	}
 
-	server := httptest.NewUnstartedServer(New(":0").Handler)
+	server := httptest.NewUnstartedServer(newTestServer().Handler)
 	server.Listener = listener
 	server.Start()
 	defer server.Close()
@@ -157,7 +157,7 @@ func TestWebSocketRejectsSensitiveContent(t *testing.T) {
 		t.Skipf("environment does not allow local network listeners: %v", err)
 	}
 
-	server := httptest.NewUnstartedServer(New(":0").Handler)
+	server := httptest.NewUnstartedServer(newTestServer().Handler)
 	server.Listener = listener
 	server.Start()
 	defer server.Close()
@@ -198,7 +198,7 @@ func TestWebSocketRejectsOversizedFrame(t *testing.T) {
 		t.Skipf("environment does not allow local network listeners: %v", err)
 	}
 
-	server := httptest.NewUnstartedServer(New(":0").Handler)
+	server := httptest.NewUnstartedServer(newTestServer().Handler)
 	server.Listener = listener
 	server.Start()
 	defer server.Close()
@@ -225,7 +225,7 @@ func TestWebSocketDropsMessagesOverUserRateLimit(t *testing.T) {
 		t.Skipf("environment does not allow local network listeners: %v", err)
 	}
 
-	server := httptest.NewUnstartedServer(New(":0").Handler)
+	server := httptest.NewUnstartedServer(newTestServer().Handler)
 	server.Listener = listener
 	server.Start()
 	defer server.Close()

@@ -28,9 +28,14 @@ func main() {
 		addr = ":8080"
 	}
 
-	// New 会创建 Gin 路由、内存房间和 WebSocket 处理器，
+	// Kafka 配置通过环境变量注入，便于本地 Docker、测试环境和生产部署使用不同 Broker。
+	// NewWithKafka 创建 Gin 路由、内存房间和 Kafka 消息总线，
 	// 最终返回一个标准库 *http.Server，方便后续统一管理超时等配置。
-	srv := httpserver.NewWithLogger(addr, logger)
+	srv, err := httpserver.NewWithKafka(addr, httpserver.KafkaConfigFromEnv(), logger)
+	if err != nil {
+		logger.Error("initialize_http_server_failed", zap.Error(err))
+		return
+	}
 	logger.Info("http_server_started", zap.String("addr", addr))
 
 	// ListenAndServe 会一直阻塞，直到服务被关闭或发生致命错误。
