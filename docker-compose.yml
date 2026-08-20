@@ -42,3 +42,15 @@ services:
       - >-
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092
         --create --if-not-exists --topic danmaku --partitions 3 --replication-factor 1
+
+  redis:
+    image: redis:8.4-alpine
+    container_name: danmuflow-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15

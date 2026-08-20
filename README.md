@@ -32,15 +32,23 @@ go run ./cmd/server
 | `DANMUFLOW_KAFKA_BROKERS` | `localhost:9092` | Kafka Broker 地址，多个地址用逗号分隔 |
 | `DANMUFLOW_KAFKA_TOPIC` | `danmaku` | 弹幕 Topic |
 | `DANMUFLOW_KAFKA_GROUP_ID` | `danmuflow-broadcast` | 房间广播消费者组 |
+| `DANMUFLOW_PUBLIC_WS_URL` | 空（禁用共享路由） | 当前实例对客户端公开的 `ws://` 或 `wss://` 地址；设置后启用 Redis 路由租约 |
+| `DANMUFLOW_GATEWAY_ID` | 主机名 | 路由响应和日志中的网关标识 |
+| `DANMUFLOW_REDIS_ADDR` | `localhost:6379` | Redis 路由目录地址 |
+| `DANMUFLOW_REDIS_PASSWORD` | 空 | Redis 密码 |
+| `DANMUFLOW_REDIS_ROUTE_PREFIX` | `danmuflow:routing` | 分区租约 key 前缀 |
 
 日志默认以 JSON 格式输出到标准输出，便于 Docker / Kubernetes / 日志采集器统一收集：
 
 ```bash
 DANMUFLOW_HTTP_ADDR=:9090 \
 DANMUFLOW_KAFKA_BROKERS=localhost:9092 \
+DANMUFLOW_PUBLIC_WS_URL=ws://localhost:9090/ws \
 DANMUFLOW_LOG_LEVEL=debug \
 go run ./cmd/server
 ```
+
+设置 `DANMUFLOW_PUBLIC_WS_URL` 后，网关会把 Kafka consumer-group 分配到的 partition 以 6 秒租约注册到 Redis，并每 2 秒续租。实例崩溃后租约自动过期；正常退出会使用进程唯一 token 条件删除，避免旧实例误删新 owner。Redis 只承载新连接的路由控制面，不参与每条弹幕的 Kafka 数据链路。
 
 启动 Kafka 后，首次运行可以使用默认的 `danmaku` Topic 和 `danmuflow-broadcast` 消费者组。Kafka 客户端使用惰性连接，服务启动时不会主动验证 Broker；发送或消费消息时如果 Kafka 不可用，日志会记录网络错误，WebSocket 发布会返回 `message_bus_unavailable`。
 
@@ -59,6 +67,9 @@ docker compose down
 ```bash
 DANMUFLOW_KAFKA_BROKERS=localhost:9092 \
 go test -tags=integration ./internal/bus -run TestKafkaBusEndToEndPreservesRoomOrder -v
+
+DANMUFLOW_REDIS_ADDR=localhost:6379 \
+go test -tags=integration ./internal/routing -run TestRedisRegistryLeaseLifecycle -v
 ```
 
 普通 `go test ./...` 不会连接 Kafka；集成测试通过 `integration` build tag 单独运行。
@@ -71,11 +82,18 @@ Kafka 消费端会把 JSON 语法损坏或缺少 `message_id`、`room_id`、`use
 - `GET /healthz`：进程存活检查
 - `GET /readyz`：流量就绪检查；要求已加入 Kafka 消费组、生产端可连接 Kafka，且未处于发布下线过程。负载均衡应使用此端点
 - `GET /metrics`：Prometheus 指标抓取端点，包含连接数、消息拒绝原因、Kafka 发布和消费处理耗时、消费者就绪/重启次数、慢客户端丢弃数与 Go 运行时指标
+- `GET /route?room_id=room-a`：查询房间当前 owner 的公开 WebSocket 地址；路由未启用、租约尚未建立或 Redis 故障时返回 HTTP 503
 - `GET /ws?room_id=room-a&user_id=alice`：建立指定房间的 WebSocket 弹幕连接（`room_id`、`user_id` 缺一不可，缺失时返回 HTTP 400）
 
 ## WebSocket 使用方式
 
-启动服务后，客户端连接：
+多网关部署时，客户端先查询 `/route?room_id=room-a`：
+
+```json
+{"room_id":"room-a","partition":1,"gateway_id":"gateway-a","websocket_url":"wss://gateway-a.example/ws"}
+```
+
+然后把 `room_id`、`user_id` 查询参数加到返回的 `websocket_url` 上建立连接。单实例或已知正确网关时可以直接连接：
 
 ```text
 ws://localhost:8080/ws?room_id=room-a&user_id=alice
@@ -133,13 +151,13 @@ ws://localhost:8080/ws?room_id=room-a&user_id=alice
 
 ## 当前限制
 
-- 房间路由只存在于单个进程内存中，尚未使用 Redis 或其他共享存储；
+- Redis 路由目录只保存短期 partition→gateway 租约，不保存房间消息、成员或序号；
 - 每个 `user_id` 默认每秒允许 5 条弹幕、最多突发 10 条，超限消息被丢弃；
 - 单条 WebSocket 数据帧最大 4 KiB，弹幕正文最多 500 个字符；
 - 默认拦截 `赌博` 和 `诈骗` 等敏感词，命中后不广播、不消耗房间序号；
 - 服务重启时，在线连接会收到 WebSocket `1012`（服务重启）并需要客户端重连；未持久化的在途消息仍可能丢失；
 - 慢客户端可能丢失自己的消息，但不会阻塞房间内其他客户端；
-- 生产入口已接入 Kafka；房间路由仍只存在于单个进程内存中，尚未使用 Redis 或其他共享存储；
+- Redis 短暂故障不会切断已有 WebSocket，但新客户端在恢复前无法通过 `/route` 发现 owner；
 - 单元测试使用 InMemoryBus，不要求测试环境运行 Kafka；
 - 尚未接入 MySQL、登录鉴权和历史消息补偿。
 
@@ -150,7 +168,8 @@ cmd/server/              服务启动入口
 internal/httpserver/     HTTP/WebSocket 网关层
 internal/room/           内存房间模型（房间注册、成员、序号、广播）
 internal/message/        跨组件弹幕消息模型
-internal/bus/             消息总线抽象、InMemoryBus 和 KafkaBus
+internal/bus/            消息总线抽象、InMemoryBus 和 KafkaBus
+internal/routing/        Redis 分区→网关租约目录与续租生命周期
 internal/ratelimit/      按 user_id 维度的令牌桶限流器
 internal/sensitive/      内存敏感词过滤
 internal/logging/        结构化日志（zap）初始化
