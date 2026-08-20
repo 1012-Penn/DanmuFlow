@@ -2,13 +2,14 @@ package httpserver
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -39,9 +40,10 @@ const (
 	// messageBusPublishWait 限制接入层等待消息队列空间的最长时间。
 	// 队列持续满时，连接不能无限期卡在 Publish 上。
 	messageBusPublishWait = time.Second
+	// messageIDBytes 使用 128 位随机数作为消息唯一标识。即使多个网关实例同时
+	// 运行或进程重启，它们也不共享计数器，随机 ID 仍具有可忽略的碰撞概率。
+	messageIDBytes = 16
 )
-
-var messageIDCounter uint64
 
 // websocketRequest 是客户端通过 WebSocket 发送给服务端的消息格式。
 // 当前只包含弹幕正文，后续可以扩展消息类型、时间戳等字段。
@@ -439,8 +441,23 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 				continue
 			}
 
+			messageID, err := newMessageID(rand.Reader)
+			if err != nil {
+				// 无法生成可靠 ID 时不能把消息写入 Kafka，否则未来幂等层无法
+				// 区分不同弹幕。该失败极少发生，但必须以明确拒绝代替空 ID。
+				observability.MessagesRejected.WithLabelValues("message_id_generation_failed").Inc()
+				logger.Error("message_id_generation_failed", append(connectionFields, zap.Error(err))...)
+				if !queueProtocolError(websocketErrorResponse{
+					Code:    messageBusUnavailableCode,
+					Message: "message queue is temporarily unavailable",
+				}) {
+					return
+				}
+				continue
+			}
+
 			danmaku := message.Danmaku{
-				MessageID: strconv.FormatUint(nextMessageID(), 10),
+				MessageID: messageID,
 				RoomID:    roomID,
 				UserID:    userID,
 				Content:   request.Content,
@@ -469,8 +486,14 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 	})
 }
 
-func nextMessageID() uint64 {
-	return atomic.AddUint64(&messageIDCounter, 1)
+// newMessageID 从加密安全随机源生成 128 位 ID，并编码为固定 32 位十六进制字符串。
+// reader 作为参数传入，使随机源失败路径可以在测试中稳定验证。
+func newMessageID(reader io.Reader) (string, error) {
+	var value [messageIDBytes]byte
+	if _, err := io.ReadFull(reader, value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
 }
 
 // writeWebSocketJSON 是连接的统一数据帧写出口。

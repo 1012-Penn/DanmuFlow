@@ -1,14 +1,56 @@
 package httpserver
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"net"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+func TestNewMessageIDProducesUnique128BitValues(t *testing.T) {
+	const sampleSize = 10_000
+	seen := make(map[string]struct{}, sampleSize)
+
+	for range sampleSize {
+		messageID, err := newMessageID(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := hex.DecodeString(messageID)
+		if err != nil {
+			t.Fatalf("message ID %q is not hexadecimal: %v", messageID, err)
+		}
+		if len(decoded) != messageIDBytes {
+			t.Fatalf("decoded message ID has %d bytes, want %d", len(decoded), messageIDBytes)
+		}
+		if _, duplicate := seen[messageID]; duplicate {
+			t.Fatalf("duplicate message ID generated in %d-value sample: %q", sampleSize, messageID)
+		}
+		seen[messageID] = struct{}{}
+	}
+}
+
+func TestNewMessageIDReturnsRandomSourceFailure(t *testing.T) {
+	if _, err := newMessageID(iotest.ErrReader(errors.New("entropy unavailable"))); err == nil {
+		t.Fatal("newMessageID() error = nil, want random source failure")
+	}
+}
+
+func BenchmarkNewMessageID(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := newMessageID(rand.Reader); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 // TestWebSocketBroadcastsToTwoClients 验证一条 WebSocket 消息会被广播给同一个房间里的多个客户端。
 func TestWebSocketBroadcastsToTwoClients(t *testing.T) {
