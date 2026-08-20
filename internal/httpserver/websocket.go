@@ -74,18 +74,27 @@ const (
 // websocketConnections 记录当前实例上已经升级的连接。http.Server.Shutdown
 // 不会自动关闭被 WebSocket 接管的连接，因此发布重启时需要它主动发送 1012。
 type websocketConnections struct {
-	mu    sync.Mutex
-	items map[*websocket.Conn]struct{}
+	mu      sync.Mutex
+	items   map[*websocket.Conn]struct{}
+	closing bool
 }
 
 func newWebSocketConnections() *websocketConnections {
 	return &websocketConnections{items: make(map[*websocket.Conn]struct{})}
 }
 
-func (connections *websocketConnections) add(conn *websocket.Conn) {
+// add 尝试把已升级连接登记到当前实例。
+// closing 与 items 共用一把锁，使“登记连接”和“发布下线取得连接快照”具有明确顺序：
+// 要么连接先登记并进入关闭快照，要么下线先开始，迟到连接会被拒绝。
+func (connections *websocketConnections) add(conn *websocket.Conn) bool {
 	connections.mu.Lock()
+	defer connections.mu.Unlock()
+
+	if connections.closing {
+		return false
+	}
 	connections.items[conn] = struct{}{}
-	connections.mu.Unlock()
+	return true
 }
 
 func (connections *websocketConnections) remove(conn *websocket.Conn) {
@@ -99,6 +108,9 @@ func (connections *websocketConnections) remove(conn *websocket.Conn) {
 // 让整个实例的下线时间随连接数线性增长。
 func (connections *websocketConnections) closeForServiceRestart(ctx context.Context) {
 	connections.mu.Lock()
+	// closing 一旦变为 true 就不再恢复。Server 进入发布下线后不会重新承接连接；
+	// 这样通过握手前检查、但尚未来得及登记的连接也不能漏出本次关闭过程。
+	connections.closing = true
 	items := make([]*websocket.Conn, 0, len(connections.items))
 	for conn := range connections.items {
 		items = append(items, conn)
@@ -111,13 +123,7 @@ func (connections *websocketConnections) closeForServiceRestart(ctx context.Cont
 		conn := conn
 		go func() {
 			defer workers.Done()
-			deadline := time.Now().Add(time.Second)
-			if until, ok := ctx.Deadline(); ok && until.Before(deadline) {
-				deadline = until
-			}
-			_ = conn.WriteControl(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service is restarting"), deadline)
-			_ = conn.Close()
+			closeWebSocketForServiceRestart(ctx, conn)
 		}()
 	}
 	finished := make(chan struct{})
@@ -129,6 +135,18 @@ func (connections *websocketConnections) closeForServiceRestart(ctx context.Cont
 	case <-finished:
 	case <-ctx.Done():
 	}
+}
+
+// closeWebSocketForServiceRestart 尽力发送 1012 后关闭连接。
+// 它既用于关闭快照中的连接，也用于拒绝在快照之后才完成升级的迟到连接。
+func closeWebSocketForServiceRestart(ctx context.Context, conn *websocket.Conn) {
+	deadline := time.Now().Add(time.Second)
+	if until, ok := ctx.Deadline(); ok && until.Before(deadline) {
+		deadline = until
+	}
+	_ = conn.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service is restarting"), deadline)
+	_ = conn.Close()
 }
 
 // protocolError 是写协程处理的一条错误响应。
@@ -197,7 +215,14 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			logger.Debug("websocket_rejected", zap.String("reason", "join_room_failed"), zap.String("room_id", roomID), zap.String("user_id", userID), zap.Error(err))
 			return
 		}
-		connections.add(conn)
+		if !connections.add(conn) {
+			// 连接可能在握手前通过 readiness 检查，但发布下线随后已经取得了
+			// 连接快照。此时不能让这条 hijacked 连接漏出 http.Server.Shutdown
+			// 的管理范围；撤销房间成员并明确通知客户端重连。
+			_ = chatRoom.Leave(userID)
+			closeWebSocketForServiceRestart(r.Context(), conn)
+			return
+		}
 		defer connections.remove(conn)
 		observability.WebSocketConnections.Inc()
 		defer observability.WebSocketConnections.Dec()
