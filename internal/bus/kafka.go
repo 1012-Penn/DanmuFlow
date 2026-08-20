@@ -252,6 +252,22 @@ func (b *KafkaBus) consumePartition(ctx context.Context, generation *kafka.Gener
 			}
 			continue
 		}
+		if err := danmaku.Validate(); err != nil {
+			// JSON 语法正确但缺少必填业务字段，同样无法靠重试恢复。提交该
+			// offset 可隔离毒消息，避免它永久阻塞同一分区后续的合法弹幕。
+			b.logger.Warn("invalid_kafka_message_skipped",
+				zap.String("topic", kafkaMessage.Topic),
+				zap.Int("partition", kafkaMessage.Partition),
+				zap.Int64("offset", kafkaMessage.Offset),
+				zap.String("message_id", danmaku.MessageID),
+				zap.String("room_id", danmaku.RoomID),
+				zap.Error(err),
+			)
+			if err := generation.CommitOffsets(offsetsAfter(kafkaMessage)); err != nil {
+				return fmt.Errorf("commit invalid message offset: %w", err)
+			}
+			continue
+		}
 
 		if err := handler(ctx, danmaku); err != nil {
 			// 房间广播等暂时性错误不能提交 offset；上层会退避重启，保证消息

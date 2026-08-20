@@ -63,6 +63,8 @@ go test -tags=integration ./internal/bus -run TestKafkaBusEndToEndPreservesRoomO
 
 普通 `go test ./...` 不会连接 Kafka；集成测试通过 `integration` build tag 单独运行。
 
+Kafka 消费端会把 JSON 语法损坏或缺少 `message_id`、`room_id`、`user_id`、`content`、`created_at` 的消息视为永久性毒消息：记录 topic、partition、offset 和错误后提交 offset 并继续消费。暂时性的房间处理错误仍不会提交 offset，会交给消费者监督循环重试。当前尚未接入死信 Topic，因此毒消息只能通过结构化日志追查，不能自动回放。
+
 ## 可用端点
 
 - `GET /`：确认服务已启动

@@ -42,6 +42,11 @@ func TestKafkaBusEndToEndPreservesRoomOrder(t *testing.T) {
 	if err := connection.Close(); err != nil {
 		t.Fatal(err)
 	}
+	metadataContext, cancelMetadata := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelMetadata()
+	if err := waitForTopicLeaders(metadataContext, config.Brokers[0], config.Topic, 3); err != nil {
+		t.Fatal(err)
+	}
 
 	messageBus, err := NewKafka(config)
 	if err != nil {
@@ -68,10 +73,19 @@ func TestKafkaBusEndToEndPreservesRoomOrder(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// 不可解析的 JSON 是永久性坏消息：消费者应记录、提交并跳过它，随后继续
-	// 处理同一个 Topic 上的合法弹幕，而不是反复在同一个 offset 崩溃。
-	poisonWriter := &kafka.Writer{Addr: kafka.TCP(config.Brokers...), Topic: config.Topic}
-	if err := poisonWriter.WriteMessages(consumeContext, kafka.Message{Value: []byte("not-json")}); err != nil {
+	// 语法损坏和缺少业务字段的 JSON 都是永久性毒消息。它们与后面的合法消息
+	// 使用相同 key，确保进入同一分区，从而验证消费者会提交并越过这两个 offset。
+	poisonWriter := &kafka.Writer{
+		Addr:     kafka.TCP(config.Brokers...),
+		Topic:    config.Topic,
+		Balancer: &kafka.Hash{},
+	}
+	poisonWriteContext, cancelPoisonWrite := context.WithTimeout(consumeContext, 5*time.Second)
+	defer cancelPoisonWrite()
+	if err := writeWhenTopicReady(poisonWriteContext, poisonWriter,
+		kafka.Message{Key: []byte("room-order"), Value: []byte("not-json")},
+		kafka.Message{Key: []byte("room-order"), Value: []byte(`{"message_id":"poison","room_id":"room-order"}`)},
+	); err != nil {
 		_ = poisonWriter.Close()
 		t.Fatal(err)
 	}
@@ -83,8 +97,10 @@ func TestKafkaBusEndToEndPreservesRoomOrder(t *testing.T) {
 		if err := messageBus.Publish(consumeContext, message.Danmaku{
 			MessageID: fmt.Sprintf("integration-%d", sequence),
 			RoomID:    "room-order",
+			UserID:    "integration-user",
 			Content:   fmt.Sprintf("message-%d", sequence),
 			Sequence:  sequence,
+			CreatedAt: time.Now(),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -104,5 +120,55 @@ func TestKafkaBusEndToEndPreservesRoomOrder(t *testing.T) {
 	cancelConsume()
 	if err := <-consumeDone; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Consume error = %v", err)
+	}
+}
+
+func writeWhenTopicReady(ctx context.Context, writer *kafka.Writer, messages ...kafka.Message) error {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		err := writer.WriteMessages(ctx, messages...)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, kafka.UnknownTopicOrPartition) {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for topic data plane: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForTopicLeaders(ctx context.Context, broker, topic string, wantPartitions int) error {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		partitions, err := kafka.LookupPartitions(ctx, "tcp", broker, topic)
+		if err == nil && len(partitions) == wantPartitions {
+			allReady := true
+			for _, partition := range partitions {
+				if partition.Error != nil || partition.Leader.Host == "" {
+					allReady = false
+					break
+				}
+			}
+			if allReady {
+				return nil
+			}
+		}
+		lastErr = err
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for %d ready partitions for topic %q: %w (last metadata error: %v)", wantPartitions, topic, ctx.Err(), lastErr)
+		case <-ticker.C:
+		}
 	}
 }
