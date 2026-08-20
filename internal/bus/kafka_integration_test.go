@@ -14,39 +14,11 @@ import (
 
 	"github.com/1012-Penn/DanmuFlow/internal/message"
 	"github.com/segmentio/kafka-go"
+	"go.uber.org/zap/zaptest"
 )
 
 func TestKafkaBusEndToEndPreservesRoomOrder(t *testing.T) {
-	brokers := os.Getenv("DANMUFLOW_KAFKA_BROKERS")
-	if brokers == "" {
-		t.Skip("set DANMUFLOW_KAFKA_BROKERS to run the Kafka integration test")
-	}
-
-	config := KafkaConfig{
-		Brokers: strings.Split(brokers, ","),
-		Topic:   "danmuflow-integration-" + strconv.FormatInt(time.Now().UnixNano(), 10),
-		GroupID: "danmuflow-integration-" + strconv.FormatInt(time.Now().UnixNano(), 10),
-	}
-	connection, err := kafka.Dial("tcp", config.Brokers[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := connection.CreateTopics(kafka.TopicConfig{
-		Topic:             config.Topic,
-		NumPartitions:     3,
-		ReplicationFactor: 1,
-	}); err != nil {
-		_ = connection.Close()
-		t.Fatal(err)
-	}
-	if err := connection.Close(); err != nil {
-		t.Fatal(err)
-	}
-	metadataContext, cancelMetadata := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancelMetadata()
-	if err := waitForTopicLeaders(metadataContext, config.Brokers[0], config.Topic, 3); err != nil {
-		t.Fatal(err)
-	}
+	config := newKafkaIntegrationConfig(t, 3)
 
 	messageBus, err := NewKafka(config)
 	if err != nil {
@@ -120,6 +92,176 @@ func TestKafkaBusEndToEndPreservesRoomOrder(t *testing.T) {
 	cancelConsume()
 	if err := <-consumeDone; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Consume error = %v", err)
+	}
+}
+
+func TestKafkaBusTracksExclusiveOwnershipAcrossRebalance(t *testing.T) {
+	config := newKafkaIntegrationConfig(t, 3)
+	firstConfig := config
+	firstConfig.Logger = zaptest.NewLogger(t).Named("first")
+	first, err := NewKafka(firstConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	secondConfig := config
+	secondConfig.Logger = zaptest.NewLogger(t).Named("second")
+	second, err := NewKafka(secondConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	testContext, cancelTest := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelTest()
+	firstContext, cancelFirst := context.WithCancel(testContext)
+	secondContext, cancelSecond := context.WithCancel(testContext)
+	defer cancelFirst()
+	defer cancelSecond()
+
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		firstDone <- first.Consume(firstContext, func(context.Context, message.Danmaku) error { return nil })
+	}()
+	go func() {
+		secondDone <- second.Consume(secondContext, func(context.Context, message.Danmaku) error { return nil })
+	}()
+
+	waitForIntegrationCondition(t, 15*time.Second, "two consumers to own all partitions exclusively", func() bool {
+		firstAssignments := first.AssignedPartitions()
+		secondAssignments := second.AssignedPartitions()
+		if !first.ConsumerReady() || !second.ConsumerReady() || len(firstAssignments) == 0 || len(secondAssignments) == 0 {
+			return false
+		}
+		seen := make(map[int]struct{}, 3)
+		for _, partition := range append(firstAssignments, secondAssignments...) {
+			if _, duplicate := seen[partition]; duplicate {
+				return false
+			}
+			seen[partition] = struct{}{}
+		}
+		return len(seen) == 3
+	})
+
+	roomsByPartition := make(map[int]string, 3)
+	for candidate := 0; candidate < 10_000 && len(roomsByPartition) < 3; candidate++ {
+		roomID := fmt.Sprintf("ownership-room-%d", candidate)
+		firstPartition, firstOK := first.PartitionForRoom(roomID)
+		secondPartition, secondOK := second.PartitionForRoom(roomID)
+		if !firstOK || !secondOK || firstPartition != secondPartition {
+			t.Fatalf("room %q partition differs between consumers: first=(%d,%t) second=(%d,%t)",
+				roomID, firstPartition, firstOK, secondPartition, secondOK)
+		}
+		roomsByPartition[firstPartition] = roomID
+	}
+	if len(roomsByPartition) != 3 {
+		t.Fatalf("found rooms for %d partitions, want 3", len(roomsByPartition))
+	}
+	for partition, roomID := range roomsByPartition {
+		ownerCount := 0
+		if first.OwnsRoom(roomID) {
+			ownerCount++
+		}
+		if second.OwnsRoom(roomID) {
+			ownerCount++
+		}
+		if ownerCount != 1 {
+			t.Fatalf("partition %d room %q owner count = %d, want 1", partition, roomID, ownerCount)
+		}
+	}
+
+	// 一个消费者退出后，它必须先清空旧 generation；存活消费者随后通过
+	// Kafka rebalance 接管全部分区，不能出现旧 owner 继续宣称归属的双主状态。
+	cancelFirst()
+	requireIntegrationConsumerStop(t, firstDone)
+	waitForIntegrationConditionOrConsumerStop(t, 15*time.Second, "remaining consumer to take all partitions", secondDone, func() bool {
+		return len(first.AssignedPartitions()) == 0 && second.ConsumerReady() && len(second.AssignedPartitions()) == 3
+	})
+	for _, roomID := range roomsByPartition {
+		if first.OwnsRoom(roomID) || !second.OwnsRoom(roomID) {
+			t.Fatalf("room %q ownership did not move exclusively to the remaining consumer", roomID)
+		}
+	}
+
+	cancelSecond()
+	requireIntegrationConsumerStop(t, secondDone)
+	if len(second.AssignedPartitions()) != 0 {
+		t.Fatalf("stopped consumer assignments = %v, want empty", second.AssignedPartitions())
+	}
+}
+
+func newKafkaIntegrationConfig(t *testing.T, partitionCount int) KafkaConfig {
+	t.Helper()
+	brokers := os.Getenv("DANMUFLOW_KAFKA_BROKERS")
+	if brokers == "" {
+		t.Skip("set DANMUFLOW_KAFKA_BROKERS to run the Kafka integration test")
+	}
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	config := KafkaConfig{
+		Brokers: strings.Split(brokers, ","),
+		Topic:   "danmuflow-integration-" + suffix,
+		GroupID: "danmuflow-integration-" + suffix,
+	}
+	connection, err := kafka.Dial("tcp", config.Brokers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.CreateTopics(kafka.TopicConfig{
+		Topic:             config.Topic,
+		NumPartitions:     partitionCount,
+		ReplicationFactor: 1,
+	}); err != nil {
+		_ = connection.Close()
+		t.Fatal(err)
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	metadataContext, cancelMetadata := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelMetadata()
+	if err := waitForTopicLeaders(metadataContext, config.Brokers[0], config.Topic, partitionCount); err != nil {
+		t.Fatal(err)
+	}
+	return config
+}
+
+func waitForIntegrationCondition(t *testing.T, timeout time.Duration, description string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", description)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitForIntegrationConditionOrConsumerStop(t *testing.T, timeout time.Duration, description string, consumerDone <-chan error, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !condition() {
+		select {
+		case err := <-consumerDone:
+			t.Fatalf("consumer stopped while waiting for %s: %v", description, err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", description)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func requireIntegrationConsumerStop(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Consume() error = %v, want context cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("consumer did not stop after context cancellation")
 	}
 }
 
