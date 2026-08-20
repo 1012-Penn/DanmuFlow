@@ -43,6 +43,9 @@ const (
 	// messageIDBytes 使用 128 位随机数作为消息唯一标识。即使多个网关实例同时
 	// 运行或进程重启，它们也不共享计数器，随机 ID 仍具有可忽略的碰撞概率。
 	messageIDBytes = 16
+	// websocketCloseWorkers 限制批量断连的并发度，避免再均衡或发布时为十万连接
+	// 瞬间创建十万个 goroutine，反而放大实例的内存与调度压力。
+	websocketCloseWorkers = 32
 )
 
 // websocketRequest 是客户端通过 WebSocket 发送给服务端的消息格式。
@@ -99,6 +102,22 @@ func (connections *websocketConnections) add(conn *websocket.Conn) bool {
 	return true
 }
 
+// closeForOwnershipChange 关闭旧 Kafka generation 下建立的全部连接。
+// 再均衡会结束整个 generation；即使本机随后拿回相同分区，旧连接也可能漏过
+// 切换窗口内的消息。先从登记表中原子摘除再批量关闭，后续监视轮次不会重复处理。
+func (connections *websocketConnections) closeForOwnershipChange(ctx context.Context) int {
+	connections.mu.Lock()
+	items := make([]*websocket.Conn, 0, len(connections.items))
+	for conn := range connections.items {
+		items = append(items, conn)
+		delete(connections.items, conn)
+	}
+	connections.mu.Unlock()
+
+	closeWebSockets(ctx, items, "room ownership changed")
+	return len(items)
+}
+
 func (connections *websocketConnections) remove(conn *websocket.Conn) {
 	connections.mu.Lock()
 	delete(connections.items, conn)
@@ -106,8 +125,8 @@ func (connections *websocketConnections) remove(conn *websocket.Conn) {
 }
 
 // closeForServiceRestart 向所有连接发出 1012（服务重启）后关闭底层连接。
-// WriteControl 可与单独的数据帧写协程并发调用；同时并发关闭各连接，避免慢客户端
-// 让整个实例的下线时间随连接数线性增长。
+// WriteControl 可与单独的数据帧写协程并发调用；批量关闭使用固定并发度，兼顾下线
+// 速度与 goroutine 数量上限。
 func (connections *websocketConnections) closeForServiceRestart(ctx context.Context) {
 	connections.mu.Lock()
 	// closing 一旦变为 true 就不再恢复。Server 进入发布下线后不会重新承接连接；
@@ -119,15 +138,45 @@ func (connections *websocketConnections) closeForServiceRestart(ctx context.Cont
 	}
 	connections.mu.Unlock()
 
+	closeWebSockets(ctx, items, "service is restarting")
+}
+
+// closeWebSockets 使用固定数量的 worker 尽力发送 1012 后关闭一批连接。
+// WriteControl 可以和数据帧写协程并发；固定并发度则让资源消耗不随连接数突增。
+func closeWebSockets(ctx context.Context, items []*websocket.Conn, reason string) {
+	if len(items) == 0 {
+		return
+	}
+	workerCount := min(len(items), websocketCloseWorkers)
+	jobs := make(chan *websocket.Conn)
 	var workers sync.WaitGroup
-	workers.Add(len(items))
-	for _, conn := range items {
-		conn := conn
+	workers.Add(workerCount)
+	for range workerCount {
 		go func() {
 			defer workers.Done()
-			closeWebSocketForServiceRestart(ctx, conn)
+			for {
+				select {
+				case conn, open := <-jobs:
+					if !open {
+						return
+					}
+					closeWebSocketForReconnect(ctx, conn, reason)
+				case <-ctx.Done():
+					return
+				}
+			}
 		}()
 	}
+	go func() {
+		defer close(jobs)
+		for _, conn := range items {
+			select {
+			case jobs <- conn:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	finished := make(chan struct{})
 	go func() {
 		workers.Wait()
@@ -139,15 +188,15 @@ func (connections *websocketConnections) closeForServiceRestart(ctx context.Cont
 	}
 }
 
-// closeWebSocketForServiceRestart 尽力发送 1012 后关闭连接。
-// 它既用于关闭快照中的连接，也用于拒绝在快照之后才完成升级的迟到连接。
-func closeWebSocketForServiceRestart(ctx context.Context, conn *websocket.Conn) {
+// closeWebSocketForReconnect 尽力发送 1012 后关闭连接。
+// 它用于服务重启、所有权变化，以及拒绝在关闭快照之后才完成升级的迟到连接。
+func closeWebSocketForReconnect(ctx context.Context, conn *websocket.Conn, reason string) {
 	deadline := time.Now().Add(time.Second)
 	if until, ok := ctx.Deadline(); ok && until.Before(deadline) {
 		deadline = until
 	}
 	_ = conn.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service is restarting"), deadline)
+		websocket.FormatCloseMessage(websocket.CloseServiceRestart, reason), deadline)
 	_ = conn.Close()
 }
 
@@ -160,7 +209,7 @@ type protocolError struct {
 
 // newWebSocketHandler 把一条 WebSocket 连接接到 room_id 对应的内存房间。
 // 每条连接有两个方向：当前 handler 读取客户端发送的消息，写协程负责把房间消息推回客户端。
-func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, messageBus bus.Bus, canAcceptConnection func() bool, canPublish func() bool, connections *websocketConnections, observability *metrics.Metrics, logger *zap.Logger) http.Handler {
+func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter, sensitiveFilter *sensitive.Filter, messageBus bus.Bus, canAcceptConnection func() bool, canPublish func() bool, ownsRoom func(string) bool, ownershipRevision func() uint64, connections *websocketConnections, observability *metrics.Metrics, logger *zap.Logger) http.Handler {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -187,6 +236,14 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 		if roomID == "" {
 			logger.Debug("websocket_rejected", zap.String("reason", "missing_room_id"))
 			http.Error(w, "room_id is required\n", http.StatusBadRequest)
+			return
+		}
+		// Kafka 分区只会被消费组中的一个实例消费。错误实例若仍接受连接，客户端
+		// 能发送却收不到本房间广播，因此在 Upgrade 前返回可观察的 HTTP 错误。
+		handshakeOwnershipRevision := ownershipRevision()
+		if !ownsRoom(roomID) {
+			logger.Debug("websocket_rejected", zap.String("reason", "room_not_owned"), zap.String("room_id", roomID))
+			http.Error(w, "room is handled by another instance\n", http.StatusMisdirectedRequest)
 			return
 		}
 
@@ -222,7 +279,15 @@ func newWebSocketHandler(rooms *room.Registry, messageLimiter *ratelimit.Limiter
 			// 连接快照。此时不能让这条 hijacked 连接漏出 http.Server.Shutdown
 			// 的管理范围；撤销房间成员并明确通知客户端重连。
 			_ = chatRoom.Leave(userID)
-			closeWebSocketForServiceRestart(r.Context(), conn)
+			closeWebSocketForReconnect(r.Context(), conn, "service is restarting")
+			return
+		}
+		// 所有权可能恰好在握手与登记之间变化。登记后立即复核，可以覆盖监视器
+		// 已经扫描完毕、这条连接才加入连接表的竞态窗口。
+		if ownershipRevision() != handshakeOwnershipRevision || !ownsRoom(roomID) {
+			connections.remove(conn)
+			_ = chatRoom.Leave(userID)
+			closeWebSocketForReconnect(r.Context(), conn, "room ownership changed")
 			return
 		}
 		defer connections.remove(conn)
