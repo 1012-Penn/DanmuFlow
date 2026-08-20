@@ -35,9 +35,9 @@ func main() {
 	}
 
 	// Kafka 配置通过环境变量注入，便于本地 Docker、测试环境和生产部署使用不同 Broker。
-	// NewWithKafka 创建 Gin 路由、内存房间和 Kafka 消息总线，
+	// NewWithKafkaAndRouting 创建 Gin 路由、内存房间、Kafka 数据面和可选 Redis 路由控制面，
 	// 最终返回一个标准库 *http.Server，方便后续统一管理超时等配置。
-	srv, err := httpserver.NewWithKafka(addr, httpserver.KafkaConfigFromEnv(), logger)
+	srv, err := httpserver.NewWithKafkaAndRouting(addr, httpserver.KafkaConfigFromEnv(), httpserver.RoutingConfigFromEnv(), logger)
 	if err != nil {
 		logger.Error("initialize_http_server_failed", zap.Error(err))
 		return

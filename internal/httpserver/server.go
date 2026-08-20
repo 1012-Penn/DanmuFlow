@@ -5,7 +5,9 @@ package httpserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/1012-Penn/DanmuFlow/internal/metrics"
 	"github.com/1012-Penn/DanmuFlow/internal/ratelimit"
 	"github.com/1012-Penn/DanmuFlow/internal/room"
+	"github.com/1012-Penn/DanmuFlow/internal/routing"
 	"github.com/1012-Penn/DanmuFlow/internal/sensitive"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -30,6 +33,8 @@ type Server struct {
 
 	stopConsumer         func()
 	stopOwnershipMonitor func()
+	routePublisher       *routing.Publisher
+	routeRegistry        routing.Registry
 	connections          *websocketConnections
 	draining             *atomic.Bool
 }
@@ -37,7 +42,7 @@ type Server struct {
 // New 创建 DanmuFlow 的 HTTP 入口。
 // 后续可以在这里继续添加路由和中间件。
 func New(addr string) *Server {
-	server, err := NewWithKafka(addr, KafkaConfigFromEnv(), zap.NewNop())
+	server, err := NewWithKafkaAndRouting(addr, KafkaConfigFromEnv(), RoutingConfigFromEnv(), zap.NewNop())
 	if err != nil {
 		panic(err)
 	}
@@ -49,7 +54,7 @@ func New(addr string) *Server {
 // 默认从 DANMUFLOW_KAFKA_* 环境变量读取 Kafka 配置，生产启动入口也可以使用
 // NewWithKafka 显式注入配置。
 func NewWithLogger(addr string, logger *zap.Logger) *Server {
-	server, err := NewWithKafka(addr, KafkaConfigFromEnv(), logger)
+	server, err := NewWithKafkaAndRouting(addr, KafkaConfigFromEnv(), RoutingConfigFromEnv(), logger)
 	if err != nil {
 		panic(err)
 	}
@@ -59,8 +64,17 @@ func NewWithLogger(addr string, logger *zap.Logger) *Server {
 // NewWithKafka 创建使用指定 Kafka 配置的 HTTP/WebSocket 入口。
 // 消息总线配置错误会返回给启动方；Kafka 的网络连接错误则会在实际发布或消费时返回。
 func NewWithKafka(addr string, kafkaConfig bus.KafkaConfig, logger *zap.Logger) (*Server, error) {
+	return NewWithKafkaAndRouting(addr, kafkaConfig, RoutingConfig{}, logger)
+}
+
+// NewWithKafkaAndRouting 创建 Kafka 数据面，并在配置了公开 WebSocket URL 时启用
+// Redis 分区路由控制面。Redis 不参与弹幕发布或广播路径。
+func NewWithKafkaAndRouting(addr string, kafkaConfig bus.KafkaConfig, routeConfig RoutingConfig, logger *zap.Logger) (*Server, error) {
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	if err := routeConfig.validate(); err != nil {
+		return nil, err
 	}
 
 	rooms := room.NewRegistry()
@@ -70,12 +84,49 @@ func NewWithKafka(addr string, kafkaConfig bus.KafkaConfig, logger *zap.Logger) 
 		return nil, err
 	}
 
-	return newServerWithBus(addr, rooms, messageBus, cancelConsumer, observability, logger), nil
+	var routeRegistry routing.Registry
+	var routePublisher *routing.Publisher
+	if routeConfig.enabled() {
+		basePrefix := strings.TrimSuffix(strings.TrimSpace(routeConfig.RedisKeyPrefix), ":")
+		if basePrefix == "" {
+			basePrefix = "danmuflow:routing"
+		}
+		keyPrefix := fmt.Sprintf("%s:%s:%s", basePrefix, kafkaConfig.Topic, kafkaConfig.GroupID)
+		redisRegistry, err := routing.NewRedisRegistry(routing.RedisConfig{
+			Address:   routeConfig.RedisAddress,
+			Password:  routeConfig.RedisPassword,
+			DB:        routeConfig.RedisDB,
+			KeyPrefix: keyPrefix,
+		})
+		if err != nil {
+			cancelConsumer()
+			return nil, err
+		}
+		ownership := messageBus.(bus.RoomOwnership)
+		routePublisher, err = routing.StartPublisher(redisRegistry, ownership, routing.PublisherConfig{
+			GatewayID:    routeConfig.GatewayID,
+			WebSocketURL: routeConfig.PublicWebSocketURL,
+			LeaseTTL:     routeConfig.LeaseTTL,
+			PollInterval: routeConfig.PollInterval,
+		}, logger.Named("routing"))
+		if err != nil {
+			_ = redisRegistry.Close()
+			cancelConsumer()
+			return nil, err
+		}
+		routeRegistry = redisRegistry
+	}
+
+	return newServerWithBusAndRouting(addr, rooms, messageBus, cancelConsumer, observability, routeRegistry, routePublisher, logger), nil
 }
 
 // newServerWithBus 构造共享路由和 WebSocket 处理器。
 // messageBus 由调用方注入，使生产环境可以使用 Kafka，单元测试可以使用 InMemoryBus。
 func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, cancelConsumer func(), observability *metrics.Metrics, logger *zap.Logger) *Server {
+	return newServerWithBusAndRouting(addr, rooms, messageBus, cancelConsumer, observability, nil, nil, logger)
+}
+
+func newServerWithBusAndRouting(addr string, rooms *room.Registry, messageBus bus.Bus, cancelConsumer func(), observability *metrics.Metrics, routeRegistry routing.Registry, routePublisher *routing.Publisher, logger *zap.Logger) *Server {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -146,6 +197,44 @@ func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, can
 	})
 	// /metrics 供 Prometheus 定期抓取，不参与 WebSocket 升级与业务路由。
 	router.GET("/metrics", gin.WrapH(observability.Handler()))
+	// /route 是 WebSocket 握手前的控制面查询。没有可用租约时返回 503，提示客户端
+	// 稍后重试；Redis 故障不会切断已经建立的数据面连接。
+	router.GET("/route", func(c *gin.Context) {
+		roomID := strings.TrimSpace(c.Query("room_id"))
+		if roomID == "" {
+			c.String(http.StatusBadRequest, "room_id is required\n")
+			return
+		}
+		if routeRegistry == nil || !hasOwnership {
+			c.String(http.StatusServiceUnavailable, "room route is temporarily unavailable\n")
+			return
+		}
+		partition, ok := ownership.PartitionForRoom(roomID)
+		if !ok {
+			c.String(http.StatusServiceUnavailable, "room route is temporarily unavailable\n")
+			return
+		}
+		lookupContext, cancelLookup := context.WithTimeout(c.Request.Context(), readinessCheckTimeout)
+		defer cancelLookup()
+		lease, err := routeRegistry.Resolve(lookupContext, partition)
+		if err != nil {
+			fields := []zap.Field{zap.String("room_id", roomID), zap.Int("partition", partition), zap.Error(err)}
+			if errors.Is(err, routing.ErrRouteNotFound) {
+				logger.Debug("gateway_route_not_ready", fields...)
+			} else {
+				logger.Warn("gateway_route_lookup_failed", fields...)
+			}
+			c.Header("Retry-After", "1")
+			c.String(http.StatusServiceUnavailable, "room route is temporarily unavailable\n")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"room_id":       roomID,
+			"partition":     partition,
+			"gateway_id":    lease.GatewayID,
+			"websocket_url": lease.WebSocketURL,
+		})
+	})
 
 	// /ws 是弹幕客户端的长连接入口。
 	// 这里把 Gin 的 ResponseWriter 和 Request 直接交给 WebSocket 处理器，
@@ -166,6 +255,8 @@ func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, can
 		Server:               server,
 		stopConsumer:         cancelConsumer,
 		stopOwnershipMonitor: stopOwnershipMonitor,
+		routePublisher:       routePublisher,
+		routeRegistry:        routeRegistry,
 		connections:          connections,
 		draining:             draining,
 	}
@@ -221,15 +312,26 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.draining.Store(true)
 	s.connections.closeForServiceRestart(ctx)
+	var shutdownErrors []error
 	if s.stopOwnershipMonitor != nil {
 		s.stopOwnershipMonitor()
+	}
+	if s.routePublisher != nil {
+		if err := s.routePublisher.Stop(ctx); err != nil {
+			shutdownErrors = append(shutdownErrors, err)
+		}
+	}
+	if s.routeRegistry != nil {
+		if err := s.routeRegistry.Close(); err != nil {
+			shutdownErrors = append(shutdownErrors, err)
+		}
 	}
 	if s.stopConsumer != nil {
 		s.stopConsumer()
 	}
 	err := s.Server.Shutdown(ctx)
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		shutdownErrors = append(shutdownErrors, err)
 	}
-	return err
+	return errors.Join(shutdownErrors...)
 }
