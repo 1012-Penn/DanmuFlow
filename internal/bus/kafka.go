@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,15 +45,23 @@ type KafkaConfig struct {
 // 同一个房间的 RoomID 会作为 Kafka key，因此 kafka.Hash 会把同一房间的
 // 消息稳定地路由到同一个 partition；同一 partition 内仍保持追加顺序。
 type KafkaBus struct {
-	writer *kafka.Writer
-	config KafkaConfig
-	logger *zap.Logger
+	writer      *kafka.Writer
+	partitioner *kafka.Hash
+	config      KafkaConfig
+	logger      *zap.Logger
 
 	// ConsumerGroup 每次 Consume 调用独享。发生瞬时错误后，上层监督循环会创建
 	// 新的一次 Consume，重新加入组；activeGroup 让 Close 能及时打断正在阻塞的读取。
 	groupMu       sync.Mutex
 	activeGroup   *kafka.ConsumerGroup
 	consumerReady atomic.Bool
+
+	// ownershipMu 让 Topic 完整分区集合与本机 assignments 作为一个快照更新。
+	// 重平衡期间读取方要么看到旧 generation，要么看到已清空/新 generation，
+	// 不能观察到只更新了一半的归属状态。
+	ownershipMu       sync.RWMutex
+	topicPartitions   []int
+	assignedPartition map[int]struct{}
 
 	closeOnce sync.Once
 	closeErr  error
@@ -76,11 +85,12 @@ func NewKafka(config KafkaConfig) (*KafkaBus, error) {
 		logger = zap.NewNop()
 	}
 
+	partitioner := &kafka.Hash{}
 	return &KafkaBus{
 		writer: &kafka.Writer{
 			Addr:     kafka.TCP(config.Brokers...),
 			Topic:    config.Topic,
-			Balancer: &kafka.Hash{},
+			Balancer: partitioner,
 			// 弹幕优先低延迟；leader 确认写入后即可返回，不等待所有副本。
 			// 代价是 leader 在复制完成前故障时，极少量消息可能丢失。
 			RequiredAcks: kafka.RequireOne,
@@ -88,8 +98,10 @@ func NewKafka(config KafkaConfig) (*KafkaBus, error) {
 			// 与 WebSocket 的 1 秒 Publish context 同时到期。
 			BatchTimeout: 10 * time.Millisecond,
 		},
-		config: config,
-		logger: logger,
+		partitioner:       partitioner,
+		config:            config,
+		logger:            logger,
+		assignedPartition: make(map[int]struct{}),
 	}, nil
 }
 
@@ -138,6 +150,7 @@ func (b *KafkaBus) Consume(ctx context.Context, handler Handler) error {
 	b.setActiveGroup(group)
 	defer func() {
 		b.consumerReady.Store(false)
+		b.clearAssignedPartitions()
 		b.clearActiveGroup(group)
 		_ = group.Close()
 	}()
@@ -156,6 +169,7 @@ func (b *KafkaBus) Consume(ctx context.Context, handler Handler) error {
 
 	for {
 		b.consumerReady.Store(false)
+		b.clearAssignedPartitions()
 		// ConsumerGroup.Next 在 Kafka 协调器异常时可能一直等不到下一代。若让它
 		// 使用整个服务生命周期的 ctx，就会把上层的指数退避监督循环永久卡住。
 		// 每次加入或重加入组最多等待 5 秒；超时后返回给监督循环，由它关闭本次
@@ -164,6 +178,26 @@ func (b *KafkaBus) Consume(ctx context.Context, handler Handler) error {
 		generation, err := group.Next(joinContext)
 		cancelJoin()
 		if err != nil {
+			if isConsumerGroupTransition(err) && ctx.Err() == nil {
+				// kafka-go 的 ConsumerGroup 内部状态机会在这些 generation 错误后
+				// 重新入组。关闭整个 group 反而会丢掉恢复进度，并额外等待一次
+				// session/join 周期；保持当前 group，下一轮 Next 获取新 assignment。
+				b.logger.Warn("kafka_consumer_group_transition_retrying",
+					zap.String("topic", b.config.Topic),
+					zap.String("group_id", b.config.GroupID),
+					zap.Error(err),
+				)
+				continue
+			}
+			return err
+		}
+		metadataContext, cancelMetadata := context.WithTimeout(ctx, consumerGroupRequestTimeout)
+		partitions, err := b.lookupTopicPartitions(metadataContext)
+		cancelMetadata()
+		if err != nil {
+			return err
+		}
+		if err := b.setPartitionOwnership(partitions, generation.Assignments[b.config.Topic]); err != nil {
 			return err
 		}
 
@@ -172,10 +206,150 @@ func (b *KafkaBus) Consume(ctx context.Context, handler Handler) error {
 		b.consumerReady.Store(true)
 		err = b.consumeGeneration(ctx, generation, handler)
 		b.consumerReady.Store(false)
+		b.clearAssignedPartitions()
 		if err != nil {
 			return err
 		}
 	}
+}
+
+func isConsumerGroupTransition(err error) bool {
+	return errors.Is(err, kafka.UnknownMemberId) ||
+		errors.Is(err, kafka.IllegalGeneration) ||
+		errors.Is(err, kafka.RebalanceInProgress)
+}
+
+func (b *KafkaBus) lookupTopicPartitions(ctx context.Context) ([]int, error) {
+	var lookupErrors []error
+	for _, broker := range b.config.Brokers {
+		partitions, err := kafka.LookupPartitions(ctx, "tcp", broker, b.config.Topic)
+		if err != nil {
+			lookupErrors = append(lookupErrors, fmt.Errorf("broker %s: %w", broker, err))
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+
+		ids := make([]int, 0, len(partitions))
+		for _, partition := range partitions {
+			if partition.Error != nil {
+				lookupErrors = append(lookupErrors,
+					fmt.Errorf("broker %s topic %s partition %d: %w", broker, b.config.Topic, partition.ID, partition.Error))
+				ids = nil
+				break
+			}
+			ids = append(ids, partition.ID)
+		}
+		if len(ids) == 0 {
+			if len(partitions) == 0 {
+				lookupErrors = append(lookupErrors, fmt.Errorf("broker %s topic %s has no partitions", broker, b.config.Topic))
+			}
+			continue
+		}
+		sort.Ints(ids)
+		return ids, nil
+	}
+	return nil, fmt.Errorf("lookup Kafka topic partitions: %w", errors.Join(lookupErrors...))
+}
+
+func (b *KafkaBus) setPartitionOwnership(partitions []int, assignments []kafka.PartitionAssignment) error {
+	available := make(map[int]struct{}, len(partitions))
+	partitionSnapshot := append([]int(nil), partitions...)
+	for _, partition := range partitionSnapshot {
+		available[partition] = struct{}{}
+	}
+	assigned := make(map[int]struct{}, len(assignments))
+	assignedSnapshot := make([]int, 0, len(assignments))
+	for _, assignment := range assignments {
+		if _, ok := available[assignment.ID]; !ok {
+			return fmt.Errorf("assigned Kafka partition %d is missing from topic metadata", assignment.ID)
+		}
+		assigned[assignment.ID] = struct{}{}
+		assignedSnapshot = append(assignedSnapshot, assignment.ID)
+	}
+	sort.Ints(assignedSnapshot)
+
+	b.ownershipMu.Lock()
+	b.topicPartitions = partitionSnapshot
+	b.assignedPartition = assigned
+	b.ownershipMu.Unlock()
+	b.logger.Info("kafka_partition_ownership_updated",
+		zap.String("topic", b.config.Topic),
+		zap.String("group_id", b.config.GroupID),
+		zap.Ints("assigned_partitions", assignedSnapshot),
+	)
+	return nil
+}
+
+func (b *KafkaBus) clearAssignedPartitions() {
+	if b == nil {
+		return
+	}
+	b.ownershipMu.Lock()
+	hadAssignments := len(b.assignedPartition) > 0
+	b.assignedPartition = make(map[int]struct{})
+	b.ownershipMu.Unlock()
+	if hadAssignments {
+		b.logger.Info("kafka_partition_ownership_cleared",
+			zap.String("topic", b.config.Topic),
+			zap.String("group_id", b.config.GroupID),
+		)
+	}
+}
+
+// PartitionForRoom 返回 roomID 按 Kafka Producer 相同规则选择的分区。
+func (b *KafkaBus) PartitionForRoom(roomID string) (int, bool) {
+	if b == nil || b.partitioner == nil || strings.TrimSpace(roomID) == "" {
+		return 0, false
+	}
+	b.ownershipMu.RLock()
+	defer b.ownershipMu.RUnlock()
+	return b.partitionForRoomLocked(roomID)
+}
+
+// OwnsRoom 报告当前 consumer-group generation 是否把 roomID 的分区分配给本机。
+func (b *KafkaBus) OwnsRoom(roomID string) bool {
+	if b == nil || b.partitioner == nil || strings.TrimSpace(roomID) == "" {
+		return false
+	}
+	b.ownershipMu.RLock()
+	defer b.ownershipMu.RUnlock()
+	partition, ok := b.partitionForRoomLocked(roomID)
+	if !ok {
+		return false
+	}
+	_, owned := b.assignedPartition[partition]
+	return owned
+}
+
+// partitionForRoomLocked 要求调用方已经持有 ownershipMu 的读锁或写锁。
+func (b *KafkaBus) partitionForRoomLocked(roomID string) (int, bool) {
+	if len(b.topicPartitions) == 0 {
+		return 0, false
+	}
+	partition := b.partitioner.Balance(kafka.Message{Key: []byte(roomID)}, b.topicPartitions...)
+	for _, available := range b.topicPartitions {
+		if partition == available {
+			return partition, true
+		}
+	}
+	return 0, false
+}
+
+// AssignedPartitions 返回当前 generation 分配给本机的有序副本。
+func (b *KafkaBus) AssignedPartitions() []int {
+	if b == nil {
+		return nil
+	}
+	b.ownershipMu.RLock()
+	partitions := make([]int, 0, len(b.assignedPartition))
+	for partition := range b.assignedPartition {
+		partitions = append(partitions, partition)
+	}
+	b.ownershipMu.RUnlock()
+	sort.Ints(partitions)
+	return partitions
 }
 
 func (b *KafkaBus) consumeGeneration(ctx context.Context, generation *kafka.Generation, handler Handler) error {
@@ -327,6 +501,7 @@ func (b *KafkaBus) Close() error {
 
 	b.closeOnce.Do(func() {
 		b.consumerReady.Store(false)
+		b.clearAssignedPartitions()
 		b.groupMu.Lock()
 		group := b.activeGroup
 		b.groupMu.Unlock()
@@ -343,3 +518,4 @@ func (b *KafkaBus) Close() error {
 // Compile-time check: KafkaBus 与 InMemoryBus 共享同一消息总线接口。
 var _ Bus = (*KafkaBus)(nil)
 var _ Readiness = (*KafkaBus)(nil)
+var _ RoomOwnership = (*KafkaBus)(nil)

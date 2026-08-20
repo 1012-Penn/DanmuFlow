@@ -30,3 +30,16 @@ type Readiness interface {
 	ConsumerReady() bool
 	Check(ctx context.Context) error
 }
+
+// RoomOwnership 暴露 Kafka 分区与当前消费者实例之间的只读归属关系。
+// HTTP 网关只依赖这个抽象判断房间是否属于本机，不直接操作 consumer-group 状态。
+type RoomOwnership interface {
+	// PartitionForRoom 返回 roomID 按生产端相同 hash 规则进入的 Kafka 分区。
+	// 元数据尚未就绪或 roomID 无效时，第二个返回值为 false。
+	PartitionForRoom(roomID string) (int, bool)
+	// OwnsRoom 报告当前 consumer-group generation 是否把该房间分区分配给本机。
+	OwnsRoom(roomID string) bool
+	// AssignedPartitions 返回当前 generation 分配给本机的有序快照。
+	// 调用方可以修改返回切片，不会影响 KafkaBus 内部状态。
+	AssignedPartitions() []int
+}
