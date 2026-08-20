@@ -20,15 +20,18 @@ import (
 
 const readinessCheckTimeout = time.Second
 
+const ownershipMonitorInterval = 100 * time.Millisecond
+
 // Server 把 HTTP Server 与 DanmuFlow 的后台资源生命周期绑定在一起。
 // 内嵌标准库 Server，保留 ListenAndServe 等熟悉 API；Shutdown 则额外处理
 // WebSocket 和消息消费者，因为它们不属于普通 HTTP 请求生命周期。
 type Server struct {
 	*http.Server
 
-	stopConsumer func()
-	connections  *websocketConnections
-	draining     *atomic.Bool
+	stopConsumer         func()
+	stopOwnershipMonitor func()
+	connections          *websocketConnections
+	draining             *atomic.Bool
 }
 
 // New 创建 DanmuFlow 的 HTTP 入口。
@@ -108,7 +111,20 @@ func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, can
 		ready := readiness.Check(checkContext) == nil
 		return ready
 	}
-	websocketHandler := newWebSocketHandler(rooms, messageLimiter, sensitiveFilter, messageBus, isReady, canPublish, connections, observability, logger.Named("websocket"))
+	ownership, hasOwnership := messageBus.(bus.RoomOwnership)
+	ownsRoom := func(roomID string) bool {
+		// InMemoryBus 等不参与 Kafka 消费组的实现没有跨实例所有权概念，
+		// 保持“本实例拥有全部房间”的原有行为。
+		return !hasOwnership || ownership.OwnsRoom(roomID)
+	}
+	ownershipRevision := func() uint64 {
+		if !hasOwnership {
+			return 0
+		}
+		return ownership.OwnershipRevision()
+	}
+	stopOwnershipMonitor := startOwnershipMonitor(ownership, hasOwnership, connections, logger.Named("ownership"))
+	websocketHandler := newWebSocketHandler(rooms, messageLimiter, sensitiveFilter, messageBus, isReady, canPublish, ownsRoom, ownershipRevision, connections, observability, logger.Named("websocket"))
 
 	// 根路径用于快速确认服务已经启动。
 	router.GET("/", func(c *gin.Context) {
@@ -147,10 +163,52 @@ func newServerWithBus(addr string, rooms *room.Registry, messageBus bus.Bus, can
 		IdleTimeout:       60 * time.Second,
 	}
 	return &Server{
-		Server:       server,
-		stopConsumer: cancelConsumer,
-		connections:  connections,
-		draining:     draining,
+		Server:               server,
+		stopConsumer:         cancelConsumer,
+		stopOwnershipMonitor: stopOwnershipMonitor,
+		connections:          connections,
+		draining:             draining,
+	}
+}
+
+// startOwnershipMonitor 在 Kafka generation 变化时复核现有连接。
+// 它轮询的是一个无锁版本号，只有版本变化才扫描连接表，因此稳定运行期间的成本
+// 与连接数无关；停止函数会等待 goroutine 退出，避免测试或服务关闭后泄漏后台任务。
+func startOwnershipMonitor(ownership bus.RoomOwnership, enabled bool, connections *websocketConnections, logger *zap.Logger) func() {
+	if !enabled {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(ownershipMonitorInterval)
+		defer ticker.Stop()
+		lastRevision := ownership.OwnershipRevision()
+		for {
+			select {
+			case <-ticker.C:
+				revision := ownership.OwnershipRevision()
+				if revision == lastRevision {
+					continue
+				}
+				lastRevision = revision
+				closeContext, closeCancel := context.WithTimeout(ctx, time.Second)
+				closed := connections.closeForOwnershipChange(closeContext)
+				closeCancel()
+				logger.Info("websocket_ownership_reconciled",
+					zap.Uint64("ownership_revision", revision),
+					zap.Ints("assigned_partitions", ownership.AssignedPartitions()),
+					zap.Int("connections_closed", closed),
+				)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
 	}
 }
 
@@ -163,6 +221,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.draining.Store(true)
 	s.connections.closeForServiceRestart(ctx)
+	if s.stopOwnershipMonitor != nil {
+		s.stopOwnershipMonitor()
+	}
 	if s.stopConsumer != nil {
 		s.stopConsumer()
 	}

@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +37,80 @@ func (unavailableBus) Check(context.Context) error { return errors.New("unavaila
 
 var _ bus.Bus = unavailableBus{}
 var _ bus.Readiness = unavailableBus{}
+
+// controlledOwnershipBus 让测试主动推进 Kafka 所有权版本，而不依赖真实 broker。
+// 内存消息链路仍保持可用，因此测试只观察 HTTP 连接生命周期。
+type controlledOwnershipBus struct {
+	*bus.InMemoryBus
+	owned    atomic.Bool
+	revision atomic.Uint64
+}
+
+func newControlledOwnershipBus(t *testing.T, owned bool) *controlledOwnershipBus {
+	t.Helper()
+	memoryBus, err := bus.NewInMemory(inMemoryBusBufferSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageBus := &controlledOwnershipBus{InMemoryBus: memoryBus}
+	messageBus.owned.Store(owned)
+	messageBus.revision.Store(1)
+	return messageBus
+}
+
+func (b *controlledOwnershipBus) PartitionForRoom(string) (int, bool) { return 0, true }
+func (b *controlledOwnershipBus) OwnsRoom(string) bool                { return b.owned.Load() }
+func (b *controlledOwnershipBus) AssignedPartitions() []int {
+	if b.owned.Load() {
+		return []int{0}
+	}
+	return nil
+}
+func (b *controlledOwnershipBus) OwnershipRevision() uint64 { return b.revision.Load() }
+func (b *controlledOwnershipBus) setOwned(owned bool) {
+	b.owned.Store(owned)
+	b.revision.Add(1)
+}
+
+// handshakeRaceBus 在第一次房间校验时推进版本，但仍报告本机拥有该分区，稳定复现
+// “握手期间失去后又拿回相同分区”的 generation 竞态窗口。
+type handshakeRaceBus struct {
+	*bus.InMemoryBus
+	transitioned atomic.Bool
+	revision     atomic.Uint64
+}
+
+func newHandshakeRaceBus(t *testing.T) *handshakeRaceBus {
+	t.Helper()
+	memoryBus, err := bus.NewInMemory(inMemoryBusBufferSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageBus := &handshakeRaceBus{InMemoryBus: memoryBus}
+	messageBus.revision.Store(1)
+	return messageBus
+}
+
+func (b *handshakeRaceBus) PartitionForRoom(string) (int, bool) { return 0, true }
+func (b *handshakeRaceBus) OwnsRoom(string) bool {
+	if b.transitioned.CompareAndSwap(false, true) {
+		b.revision.Add(1)
+	}
+	return true
+}
+func (b *handshakeRaceBus) AssignedPartitions() []int { return []int{0} }
+func (b *handshakeRaceBus) OwnershipRevision() uint64 { return b.revision.Load() }
+
+func newServerWithOwnershipBus(messageBus bus.Bus) *Server {
+	observability := metrics.New()
+	rooms := room.NewRegistry()
+	return newServerWithBus(":0", rooms, messageBus,
+		startMessageBusConsumer(rooms, messageBus, observability, zap.NewNop()), observability, zap.NewNop())
+}
+
+func websocketTestURL(httpURL, query string) string {
+	return "ws" + strings.TrimPrefix(httpURL, "http") + "/ws?" + query
+}
 
 func TestHealthzAndReadyzDescribeDifferentStates(t *testing.T) {
 	messageBus := unavailableBus{}
@@ -95,6 +171,81 @@ func TestShutdownNotifiesWebSocketClientToReconnect(t *testing.T) {
 
 	if err := <-serveDone; !errors.Is(err, http.ErrServerClosed) {
 		t.Fatalf("Serve() error = %v, want %v", err, http.ErrServerClosed)
+	}
+}
+
+func TestWebSocketRejectsRoomOwnedByAnotherInstance(t *testing.T) {
+	messageBus := newControlledOwnershipBus(t, false)
+	server := newServerWithOwnershipBus(messageBus)
+	httpServer := httptest.NewServer(server.Handler)
+	t.Cleanup(func() {
+		httpServer.Close()
+		_ = server.Shutdown(context.Background())
+	})
+
+	conn, response, err := websocket.DefaultDialer.Dial(
+		websocketTestURL(httpServer.URL, "room_id=room-a&user_id=alice"), nil)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil {
+		t.Fatal("WebSocket dial succeeded on an instance that does not own the room")
+	}
+	if response == nil || response.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("handshake response = %v, want HTTP %d", response, http.StatusMisdirectedRequest)
+	}
+	response.Body.Close()
+}
+
+func TestOwnershipGenerationChangeClosesExistingWebSocketEvenWhenPartitionReturns(t *testing.T) {
+	messageBus := newControlledOwnershipBus(t, true)
+	server := newServerWithOwnershipBus(messageBus)
+	httpServer := httptest.NewServer(server.Handler)
+	t.Cleanup(func() {
+		httpServer.Close()
+		_ = server.Shutdown(context.Background())
+	})
+
+	conn, _, err := websocket.DefaultDialer.Dial(
+		websocketTestURL(httpServer.URL, "room_id=room-a&user_id=alice"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	messageBus.setOwned(false)
+	// 在监视器下一次轮询前拿回同一分区，模拟一次很短的再均衡窗口。
+	// 连接仍必须断开，因为旧 generation 期间可能已经漏过消息。
+	messageBus.setOwned(true)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = conn.ReadMessage()
+	closeError, ok := err.(*websocket.CloseError)
+	if !ok || closeError.Code != websocket.CloseServiceRestart || closeError.Text != "room ownership changed" {
+		t.Fatalf("close error = %v, want WebSocket 1012 ownership change", err)
+	}
+}
+
+func TestOwnershipIsRecheckedAfterWebSocketRegistration(t *testing.T) {
+	messageBus := newHandshakeRaceBus(t)
+	server := newServerWithOwnershipBus(messageBus)
+	httpServer := httptest.NewServer(server.Handler)
+	t.Cleanup(func() {
+		httpServer.Close()
+		_ = server.Shutdown(context.Background())
+	})
+
+	conn, _, err := websocket.DefaultDialer.Dial(
+		websocketTestURL(httpServer.URL, "room_id=room-a&user_id=alice"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = conn.ReadMessage()
+	closeError, ok := err.(*websocket.CloseError)
+	if !ok || closeError.Code != websocket.CloseServiceRestart || closeError.Text != "room ownership changed" {
+		t.Fatalf("close error = %v, want WebSocket 1012 ownership change", err)
 	}
 }
 

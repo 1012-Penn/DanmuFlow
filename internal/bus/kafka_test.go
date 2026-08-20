@@ -119,6 +119,10 @@ func TestKafkaBusRoomOwnershipMatchesProducerPartitioner(t *testing.T) {
 	if err := messageBus.setPartitionOwnership([]int{0, 1, 2}, assignments); err != nil {
 		t.Fatal(err)
 	}
+	assignedRevision := messageBus.OwnershipRevision()
+	if assignedRevision == 0 {
+		t.Fatal("setting ownership did not advance the ownership revision")
+	}
 
 	for _, roomID := range []string{"room-a", "room-b", "hot-room", "room-1000"} {
 		want := (&kafka.Hash{}).Balance(kafka.Message{Key: []byte(roomID)}, 0, 1, 2)
@@ -142,6 +146,9 @@ func TestKafkaBusRoomOwnershipMatchesProducerPartitioner(t *testing.T) {
 	}
 
 	messageBus.clearAssignedPartitions()
+	if got := messageBus.OwnershipRevision(); got <= assignedRevision {
+		t.Fatalf("clearing ownership revision = %d, want greater than %d", got, assignedRevision)
+	}
 	if messageBus.OwnsRoom("room-a") || len(messageBus.AssignedPartitions()) != 0 {
 		t.Fatal("cleared generation still reports owned rooms or partitions")
 	}
@@ -239,6 +246,25 @@ func BenchmarkKafkaBusOwnsRoom(b *testing.B) {
 	b.RunParallel(func(parallel *testing.PB) {
 		for parallel.Next() {
 			_ = messageBus.OwnsRoom("benchmark-hot-room")
+		}
+	})
+}
+
+func BenchmarkKafkaBusOwnershipRevision(b *testing.B) {
+	messageBus, err := NewKafka(KafkaConfig{
+		Brokers: []string{"localhost:9092"},
+		Topic:   "danmaku",
+		GroupID: "broadcast",
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = messageBus.Close() })
+
+	b.ReportAllocs()
+	b.RunParallel(func(parallel *testing.PB) {
+		for parallel.Next() {
+			_ = messageBus.OwnershipRevision()
 		}
 	})
 }

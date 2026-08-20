@@ -62,6 +62,7 @@ type KafkaBus struct {
 	ownershipMu       sync.RWMutex
 	topicPartitions   []int
 	assignedPartition map[int]struct{}
+	ownershipRevision atomic.Uint64
 
 	closeOnce sync.Once
 	closeErr  error
@@ -273,6 +274,7 @@ func (b *KafkaBus) setPartitionOwnership(partitions []int, assignments []kafka.P
 	b.ownershipMu.Lock()
 	b.topicPartitions = partitionSnapshot
 	b.assignedPartition = assigned
+	b.ownershipRevision.Add(1)
 	b.ownershipMu.Unlock()
 	b.logger.Info("kafka_partition_ownership_updated",
 		zap.String("topic", b.config.Topic),
@@ -289,6 +291,7 @@ func (b *KafkaBus) clearAssignedPartitions() {
 	b.ownershipMu.Lock()
 	hadAssignments := len(b.assignedPartition) > 0
 	b.assignedPartition = make(map[int]struct{})
+	b.ownershipRevision.Add(1)
 	b.ownershipMu.Unlock()
 	if hadAssignments {
 		b.logger.Info("kafka_partition_ownership_cleared",
@@ -350,6 +353,15 @@ func (b *KafkaBus) AssignedPartitions() []int {
 	b.ownershipMu.RUnlock()
 	sort.Ints(partitions)
 	return partitions
+}
+
+// OwnershipRevision 返回所有权状态的单调递增版本。
+// 版本在分区分配和清空时都递增，因此“失去后又拿回同一分区”也不会被连接层漏掉。
+func (b *KafkaBus) OwnershipRevision() uint64 {
+	if b == nil {
+		return 0
+	}
+	return b.ownershipRevision.Load()
 }
 
 func (b *KafkaBus) consumeGeneration(ctx context.Context, generation *kafka.Generation, handler Handler) error {

@@ -42,4 +42,7 @@ type RoomOwnership interface {
 	// AssignedPartitions 返回当前 generation 分配给本机的有序快照。
 	// 调用方可以修改返回切片，不会影响 KafkaBus 内部状态。
 	AssignedPartitions() []int
+	// OwnershipRevision 返回所有权快照的单调递增版本。
+	// 即使再均衡前后拿到相同分区，版本也会变化，让连接层不会漏掉中间的所有权中断。
+	OwnershipRevision() uint64
 }
