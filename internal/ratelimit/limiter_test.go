@@ -12,8 +12,11 @@ func TestLimiterAllowsBurstThenRejects(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !limiter.Allow("alice") || !limiter.Allow("alice") {
-		t.Fatal("limiter did not allow the configured burst")
+	if !limiter.Allow("alice") {
+		t.Fatal("limiter rejected the first request in the configured burst")
+	}
+	if !limiter.Allow("alice") {
+		t.Fatal("limiter rejected the second request in the configured burst")
 	}
 	if limiter.Allow("alice") {
 		t.Fatal("limiter allowed a third immediate request")

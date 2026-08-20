@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -84,7 +85,7 @@ func New() *Metrics {
 		metrics.ConsumerRunning,
 		metrics.ConsumerReady,
 		metrics.ConsumerRestarts,
-		prometheus.NewGoCollector(),
+		collectors.NewGoCollector(),
 	)
 
 	return metrics
